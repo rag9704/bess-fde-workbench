@@ -13,6 +13,7 @@ from typing import Literal
 import uuid
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import RedirectResponse
 import pandas as pd
 from pydantic import BaseModel, Field
 
@@ -115,6 +116,12 @@ async def log_requests(request: Request, call_next):
         },
     )
     return response
+
+
+@app.get("/", include_in_schema=False)
+def root() -> RedirectResponse:
+    """Opening the base URL in a browser lands on the interactive API docs."""
+    return RedirectResponse(url="/docs")
 
 
 @app.get("/health")

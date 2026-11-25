@@ -9,6 +9,11 @@ def client():
     return TestClient(app)
 
 
+def test_root_redirects_to_docs(client):
+    r = client.get("/", follow_redirects=False)
+    assert r.status_code == 307 and r.headers["location"] == "/docs"
+
+
 def test_health(client):
     r = client.get("/health")
     assert r.status_code == 200 and "highs" in r.json()["solvers"]
