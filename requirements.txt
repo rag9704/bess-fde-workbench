@@ -1,6 +1,10 @@
+# Runtime dependencies
 numpy>=2.0
-pandas>=2.0
-scipy>=1.11  # milp (HiGHS) solver
-
-# Optional: JijModeling formulation (not required; SciPy HiGHS is used to solve)
-# jijmodeling
+pandas>=2.2
+scipy>=1.13                     # reference MILP backend (scipy.optimize.milp)
+jijmodeling>=2.12,<3            # symbolic model
+ommx>=2.9,<3                    # solver-independent instance format
+ommx-highs-adapter>=2.9,<3      # default solver: HiGHS
+ommx-pyscipopt-adapter>=2.9,<3  # alternative solver: SCIP
+fastapi>=0.115                  # HTTP API
+uvicorn>=0.30

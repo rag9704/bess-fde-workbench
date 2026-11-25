@@ -1,16 +1,42 @@
-from dataclasses import dataclass
+"""Solve the BESS dispatch model with a pluggable backend.
+
+Backends (all consume the same instance data from `make_instance_data`):
+  * "highs" (default): JijModeling -> OMMX Instance -> HiGHS via ommx-highs-adapter
+  * "scip":            JijModeling -> OMMX Instance -> SCIP via ommx-pyscipopt-adapter
+  * "scipy":           hand-built sparse matrix -> scipy.optimize.milp (HiGHS).
+                       Independent re-implementation kept as a reference / cross-check.
+"""
+
+from collections.abc import Callable
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+import logging
+import os
+import sys
+import threading
 import time
 from typing import Any
+
 import numpy as np
 from scipy.optimize import Bounds, LinearConstraint, milp
+from scipy.sparse import coo_matrix
 
-from .formulation import BessParams, build_jijmodeling_problem, make_instance_data
+from .formulation import BessParams, build_problem, make_instance_data
+
+logger = logging.getLogger(__name__)
+
+SOLVERS = ("highs", "scip", "scipy")
+BACKEND_LABELS = {
+    "highs": "JijModeling + OMMX / HiGHS",
+    "scip": "JijModeling + OMMX / SCIP",
+    "scipy": "scipy.optimize.milp (reference)",
+}
 
 
 @dataclass
 class DispatchResult:
     status: str
-    objective_yen: float | None
+    objective_yen: float | None  # Operational cost, excluding artificial slack penalties
     solve_time_sec: float
     backend: str
     elastic: bool
@@ -26,6 +52,7 @@ class DispatchResult:
     p_dis_kw: np.ndarray
     slack_soc_kwh: np.ndarray
     slack_imp_kw: np.ndarray
+    timings: dict[str, float] = field(default_factory=dict)
 
     def infeasibility_summary(self, timestamps: list[str] | None = None) -> list[str]:
         """Return human-readable constraint violations when elastic slack > 1e-4 is active."""
@@ -36,216 +63,294 @@ class DispatchResult:
                 notes.append(f"Grid import cap exceeded by {val:.1f} kW at {label}")
         for idx, val in enumerate(self.slack_soc_kwh):
             if val > 1e-4:
-                label = timestamps[idx] if timestamps and idx < len(timestamps) else f"t={idx}"
+                # slack_soc is per *state*: state k is the SoC at the start of step k
+                label = timestamps[idx] if timestamps and idx < len(timestamps) else f"end of horizon (state {idx})"
                 notes.append(f"Minimum SoC reserve shortfall of {val:.1f} kWh at {label}")
         return notes
 
 
-def _solve_with_scipy_milp(data: dict[str, Any], elastic: bool) -> DispatchResult:
-    """Solver fallback using SciPy HiGHS MILP so the pipeline runs standalone if OMMX isn't installed."""
-    t0 = time.perf_counter()
-    T = len(data["load"])
+class Infeasible(Exception):
+    """Raised by a backend when the instance has no feasible solution."""
+
+
+# --------------------------------------------------------------------------- helpers
+
+
+def _operational_cost(data: dict[str, Any], p_imp, p_exp, p_ch, p_dis, peak) -> float:
     dt = data["dt"]
-    eta_ch = data["eta_ch"]
-    eta_dis = data["eta_dis"]
-    p_ch_max = data["p_ch_max"]
-    p_dis_max = data["p_dis_max"]
-
-    # Variable layout:
-    # 0..T-1: p_imp
-    # T..2T-1: p_exp
-    # 2T..3T-1: p_ch
-    # 3T..4T-1: p_dis
-    # 4T..5T: soc (T+1 vars)
-    # 5T+1..6T: z_ch (T binary vars)
-    # 6T+1: p_peak (1 var)
-    # If elastic:
-    #   6T+2..7T+2: s_soc_min (T+1 vars)
-    #   7T+3..8T+2: s_imp_cap (T vars)
-    n_soc = T + 1
-    base_vars = 4 * T + n_soc + T + 1
-    n_vars = base_vars + (n_soc + T if elastic else 0)
-
-    c = np.zeros(n_vars, dtype=float)
-    c[0:T] = data["price_imp"] * dt
-    c[T : 2 * T] = -data["price_exp"] * dt
-    c[2 * T : 3 * T] = data["c_deg"] * dt
-    c[3 * T : 4 * T] = data["c_deg"] * dt
-    c[6 * T + 1] = data["c_peak"]
-
-    if elastic:
-        m_pen = data["m_pen"]
-        c[base_vars : base_vars + n_soc] = m_pen
-        c[base_vars + n_soc : base_vars + n_soc + T] = m_pen * dt
-
-    lb = np.zeros(n_vars, dtype=float)
-    ub = np.full(n_vars, np.inf, dtype=float)
-    ub[0:T] = data["grid_imp_cap"]
-    ub[T : 2 * T] = data["p_exp_max"]
-    ub[2 * T : 3 * T] = p_ch_max
-    ub[3 * T : 4 * T] = p_dis_max
-    ub[4 * T : 4 * T + n_soc] = np.minimum(data["cap_kwh"], data["soc_max"])
-    ub[5 * T + 1 : 6 * T + 1] = 1.0
-
-    # Lower bounds on soc
-    lb[4 * T : 4 * T + n_soc] = data["soc_min"]
-    if elastic:
-        # Allow soc to drop below soc_min when s_soc_min > 0
-        lb[4 * T : 4 * T + n_soc] = 0.0
-        ub[0:T] = np.inf  # Handled via elastic constraint row below
-
-    integrality = np.zeros(n_vars, dtype=int)
-    integrality[5 * T + 1 : 6 * T + 1] = 1
-
-    rows: list[np.ndarray] = []
-    row_lb: list[float] = []
-    row_ub: list[float] = []
-
-    def add_row(coeffs: np.ndarray, lo: float, hi: float) -> None:
-        rows.append(coeffs)
-        row_lb.append(lo)
-        row_ub.append(hi)
-
-    # 1. Power balance: p_imp - p_exp + p_ch - p_dis == load - solar
-    for t_idx in range(T):
-        r = np.zeros(n_vars)
-        r[t_idx] = 1.0
-        r[T + t_idx] = -1.0
-        r[2 * T + t_idx] = 1.0
-        r[3 * T + t_idx] = -1.0
-        rhs = data["load"][t_idx] - data["solar"][t_idx]
-        add_row(r, rhs, rhs)
-
-    # 2. Initial SoC: soc[0] == soc_init
-    r0 = np.zeros(n_vars)
-    r0[4 * T] = 1.0
-    add_row(r0, data["soc_init"], data["soc_init"])
-
-    # 3. Terminal SoC floor: soc[T] >= soc_end_min
-    rT = np.zeros(n_vars)
-    rT[4 * T + T] = 1.0
-    add_row(rT, data["soc_end_min"], np.inf)
-
-    # 4. SoC dynamics: soc[t+1] - soc[t] - eta_ch*dt*p_ch + (dt/eta_dis)*p_dis == 0
-    for t_idx in range(T):
-        r = np.zeros(n_vars)
-        r[4 * T + t_idx + 1] = 1.0
-        r[4 * T + t_idx] = -1.0
-        r[2 * T + t_idx] = -eta_ch * dt
-        r[3 * T + t_idx] = dt / eta_dis
-        add_row(r, 0.0, 0.0)
-
-    # 5. Charge & discharge mutual exclusion via binary z_ch[t]
-    for t_idx in range(T):
-        # p_ch[t] - p_ch_max * z_ch[t] <= 0
-        r_ch = np.zeros(n_vars)
-        r_ch[2 * T + t_idx] = 1.0
-        r_ch[5 * T + 1 + t_idx] = -p_ch_max
-        add_row(r_ch, -np.inf, 0.0)
-
-        # p_dis[t] + p_dis_max * z_ch[t] <= p_dis_max
-        r_dis = np.zeros(n_vars)
-        r_dis[3 * T + t_idx] = 1.0
-        r_dis[5 * T + 1 + t_idx] = p_dis_max
-        add_row(r_dis, -np.inf, p_dis_max)
-
-    # 6. Peak import definition: p_peak - p_imp[t] >= 0
-    for t_idx in range(T):
-        rp = np.zeros(n_vars)
-        rp[6 * T + 1] = 1.0
-        rp[t_idx] = -1.0
-        add_row(rp, 0.0, np.inf)
-
-    # 7. Elastic slack constraints if enabled
-    if elastic:
-        # soc[t] + s_soc_min[t] >= soc_min[t]
-        for k in range(n_soc):
-            rs = np.zeros(n_vars)
-            rs[4 * T + k] = 1.0
-            rs[base_vars + k] = 1.0
-            add_row(rs, data["soc_min"][k], np.inf)
-
-        # p_imp[t] - s_imp_cap[t] <= grid_imp_cap[t]
-        for t_idx in range(T):
-            rg = np.zeros(n_vars)
-            rg[t_idx] = 1.0
-            rg[base_vars + n_soc + t_idx] = -1.0
-            add_row(rg, -np.inf, data["grid_imp_cap"][t_idx])
-
-    A = np.vstack(rows)
-    res = milp(
-        c=c,
-        integrality=integrality,
-        bounds=Bounds(lb, ub),
-        constraints=LinearConstraint(A, row_lb, row_ub),
-    )
-    elapsed = time.perf_counter() - t0
-
-    if not res.success or res.x is None:
-        zeros_t = np.zeros(T)
-        zeros_s = np.zeros(n_soc)
-        return DispatchResult(
-            status="INFEASIBLE",
-            objective_yen=None,
-            solve_time_sec=elapsed,
-            backend="scipy.optimize.milp (HiGHS)",
-            elastic=elastic,
-            peak_import_kw=0.0,
-            total_import_kwh=0.0,
-            total_export_kwh=0.0,
-            total_charge_kwh=0.0,
-            total_discharge_kwh=0.0,
-            soc_kwh=zeros_s,
-            p_imp_kw=zeros_t,
-            p_exp_kw=zeros_t,
-            p_ch_kw=zeros_t,
-            p_dis_kw=zeros_t,
-            slack_soc_kwh=zeros_s,
-            slack_imp_kw=zeros_t,
-        )
-
-    x = res.x
-    p_imp = x[0:T]
-    p_exp = x[T : 2 * T]
-    p_ch = x[2 * T : 3 * T]
-    p_dis = x[3 * T : 4 * T]
-    soc = x[4 * T : 4 * T + n_soc]
-    peak_kw = float(x[6 * T + 1])
-
-    if elastic:
-        slack_soc = x[base_vars : base_vars + n_soc]
-        slack_imp = x[base_vars + n_soc : base_vars + n_soc + T]
-    else:
-        slack_soc = np.zeros(n_soc)
-        slack_imp = np.zeros(T)
-
-    # True operational cost (excluding artificial slack penalty)
-    true_obj = float(
-        np.sum(data["price_imp"] * p_imp * dt)
-        - np.sum(data["price_exp"] * p_exp * dt)
-        + np.sum(data["c_deg"] * (p_ch + p_dis) * dt)
-        + data["c_peak"] * peak_kw
+    return float(
+        np.sum(data["price_imp"] * p_imp) * dt
+        - np.sum(data["price_exp"] * p_exp) * dt
+        + data["c_deg"] * np.sum(p_ch + p_dis) * dt
+        + data["c_peak"] * peak
     )
 
+
+def _make_result(data, elastic, backend, timings, values: dict[str, np.ndarray]) -> DispatchResult:
+    dt = data["dt"]
+    p_imp, p_exp, p_ch, p_dis = (values[k] for k in ("p_imp", "p_exp", "p_ch", "p_dis"))
+    peak = float(values["p_peak"])
     return DispatchResult(
         status="OPTIMAL",
-        objective_yen=true_obj,
-        solve_time_sec=elapsed,
-        backend="scipy.optimize.milp (HiGHS)",
+        objective_yen=_operational_cost(data, p_imp, p_exp, p_ch, p_dis, peak),
+        solve_time_sec=sum(timings.values()),
+        backend=BACKEND_LABELS[backend],
         elastic=elastic,
-        peak_import_kw=peak_kw,
-        total_import_kwh=float(np.sum(p_imp * dt)),
-        total_export_kwh=float(np.sum(p_exp * dt)),
-        total_charge_kwh=float(np.sum(p_ch * dt)),
-        total_discharge_kwh=float(np.sum(p_dis * dt)),
-        soc_kwh=soc,
+        peak_import_kw=peak,
+        total_import_kwh=float(np.sum(p_imp) * dt),
+        total_export_kwh=float(np.sum(p_exp) * dt),
+        total_charge_kwh=float(np.sum(p_ch) * dt),
+        total_discharge_kwh=float(np.sum(p_dis) * dt),
+        soc_kwh=values["soc"],
         p_imp_kw=p_imp,
         p_exp_kw=p_exp,
         p_ch_kw=p_ch,
         p_dis_kw=p_dis,
-        slack_soc_kwh=slack_soc,
-        slack_imp_kw=slack_imp,
+        slack_soc_kwh=values["s_soc_min"],
+        slack_imp_kw=values["s_imp_cap"],
+        timings=timings,
     )
+
+
+def _infeasible_result(data, elastic, backend, timings) -> DispatchResult:
+    T = data["T"]
+    zt, zs = np.zeros(T), np.zeros(T + 1)
+    return DispatchResult(
+        status="INFEASIBLE",
+        objective_yen=None,
+        solve_time_sec=sum(timings.values()),
+        backend=BACKEND_LABELS[backend],
+        elastic=elastic,
+        peak_import_kw=0.0,
+        total_import_kwh=0.0,
+        total_export_kwh=0.0,
+        total_charge_kwh=0.0,
+        total_discharge_kwh=0.0,
+        soc_kwh=zs,
+        p_imp_kw=zt,
+        p_exp_kw=zt,
+        p_ch_kw=zt,
+        p_dis_kw=zt,
+        slack_soc_kwh=zs,
+        slack_imp_kw=zt,
+        timings=timings,
+    )
+
+
+# --------------------------------------------------------------------------- OMMX backends
+
+_VAR_NAMES = ("p_imp", "p_exp", "p_ch", "p_dis", "soc", "s_soc_min", "s_imp_cap")
+
+
+def _solve_with_ommx(data: dict[str, Any], solve_fn: Callable) -> tuple[dict[str, np.ndarray], dict[str, float]]:
+    from ommx.adapter import InfeasibleDetected
+
+    t0 = time.perf_counter()
+    instance = build_problem().eval(data)
+    t1 = time.perf_counter()
+    try:
+        solution = solve_fn(instance)
+    except InfeasibleDetected as exc:
+        raise Infeasible from exc
+    finally:
+        t2 = time.perf_counter()
+    timings = {"compile_sec": t1 - t0, "solve_sec": t2 - t1}
+
+    values: dict[str, np.ndarray] = {}
+    for name in _VAR_NAMES:
+        d = solution.extract_decision_variables(name)
+        values[name] = np.array([d[k] for k in sorted(d)], dtype=float)
+    peak = solution.extract_decision_variables("p_peak")
+    values["p_peak"] = np.array(next(iter(peak.values())), dtype=float)
+    return values, timings
+
+
+@contextmanager
+def _quiet_c_stdout():
+    """HiGHS prints a copyright banner from C code; redirect fd 1 so CLI/API output stays clean."""
+    try:
+        fd = sys.stdout.fileno()
+    except (AttributeError, OSError, ValueError):  # e.g. captured stdout in tests
+        yield
+        return
+    sys.stdout.flush()
+    saved = os.dup(fd)
+    try:
+        with open(os.devnull, "w") as devnull:
+            os.dup2(devnull.fileno(), fd)
+            yield
+    finally:
+        os.dup2(saved, fd)
+        os.close(saved)
+
+
+_highs_banner_lock = threading.Lock()
+_highs_banner_shown = False
+
+
+def _highs(instance):
+    from ommx_highs_adapter import OMMXHighsAdapter
+
+    global _highs_banner_shown
+    # The banner is printed only by the first Highs() in a process, so silence just that
+    # call. The fd redirect is process-wide, hence the lock (the API solves in threads).
+    if not _highs_banner_shown:
+        with _highs_banner_lock:
+            if not _highs_banner_shown:
+                with _quiet_c_stdout():
+                    solution = OMMXHighsAdapter.solve(instance)
+                _highs_banner_shown = True
+                return solution
+    return OMMXHighsAdapter.solve(instance)
+
+
+def _scip(instance):
+    from ommx_pyscipopt_adapter import OMMXPySCIPOptAdapter
+
+    return OMMXPySCIPOptAdapter.solve(instance)
+
+
+# --------------------------------------------------------------------------- SciPy reference
+
+
+def _solve_with_scipy(data: dict[str, Any]) -> tuple[dict[str, np.ndarray], dict[str, float]]:
+    """Independent sparse-matrix implementation of the same model (for cross-checking)."""
+    t0 = time.perf_counter()
+    T, dt = data["T"], data["dt"]
+    S = T + 1
+    # Variable offsets
+    o = {}
+    n = 0
+    for name, size in [
+        ("p_imp", T),
+        ("p_exp", T),
+        ("p_ch", T),
+        ("p_dis", T),
+        ("soc", S),
+        ("z_ch", T),
+        ("p_peak", 1),
+        ("s_soc_min", S),
+        ("s_imp_cap", T),
+    ]:
+        o[name] = n
+        n += size
+
+    c = np.zeros(n)
+    c[o["p_imp"] : o["p_imp"] + T] = data["price_imp"] * dt
+    c[o["p_exp"] : o["p_exp"] + T] = -data["price_exp"] * dt
+    c[o["p_ch"] : o["p_ch"] + T] = data["c_deg"] * dt
+    c[o["p_dis"] : o["p_dis"] + T] = data["c_deg"] * dt
+    c[o["p_peak"]] = data["c_peak"]
+    c[o["s_soc_min"] : o["s_soc_min"] + S] = data["m_pen"]
+    c[o["s_imp_cap"] : o["s_imp_cap"] + T] = data["m_pen"] * dt
+
+    lb, ub = np.zeros(n), np.zeros(n)
+    for name, size, hi in [
+        ("p_imp", T, data["p_imp_bound"]),
+        ("p_exp", T, data["p_exp_max"]),
+        ("p_ch", T, data["p_ch_max"]),
+        ("p_dis", T, data["p_dis_max"]),
+        ("soc", S, data["cap_kwh"]),
+        ("z_ch", T, 1.0),
+        ("p_peak", 1, data["p_imp_bound"]),
+        ("s_soc_min", S, data["slack_ub_soc"]),
+        ("s_imp_cap", T, data["slack_ub_imp"]),
+    ]:
+        ub[o[name] : o[name] + size] = hi
+    integrality = np.zeros(n, dtype=int)
+    integrality[o["z_ch"] : o["z_ch"] + T] = 1
+
+    rows, cols, vals, rlo, rhi = [], [], [], [], []
+    r = 0
+
+    def add(entries: list[tuple[int, float]], lo: float, hi: float) -> None:
+        nonlocal r
+        for col, v in entries:
+            rows.append(r)
+            cols.append(col)
+            vals.append(v)
+        rlo.append(lo)
+        rhi.append(hi)
+        r += 1
+
+    soc = o["soc"]
+    for t in range(T):
+        # load + ch + exp == solar + dis + imp   <=>   imp - exp - ch + dis == load - solar
+        rhs = data["load"][t] - data["solar"][t]
+        add([(o["p_imp"] + t, 1), (o["p_exp"] + t, -1), (o["p_ch"] + t, -1), (o["p_dis"] + t, 1)], rhs, rhs)
+        add(
+            [
+                (soc + t + 1, 1),
+                (soc + t, -1),
+                (o["p_ch"] + t, -data["eta_ch"] * dt),
+                (o["p_dis"] + t, dt / data["eta_dis"]),
+            ],
+            0,
+            0,
+        )
+        add([(o["p_ch"] + t, 1), (o["z_ch"] + t, -data["p_ch_max"])], -np.inf, 0)
+        add([(o["p_dis"] + t, 1), (o["z_ch"] + t, data["p_dis_max"])], -np.inf, data["p_dis_max"])
+        add([(o["p_peak"], 1), (o["p_imp"] + t, -1)], 0, np.inf)
+        add([(o["p_imp"] + t, 1), (o["s_imp_cap"] + t, -1)], -np.inf, data["grid_imp_cap"][t])
+    add([(soc, 1)], data["soc_init"], data["soc_init"])
+    add([(soc + T, 1)], data["soc_end_min"], np.inf)
+    for k in range(S):
+        add([(soc + k, 1)], -np.inf, data["soc_max"][k])
+        add([(soc + k, 1), (o["s_soc_min"] + k, 1)], data["soc_min"][k], np.inf)
+
+    A = coo_matrix((vals, (rows, cols)), shape=(r, n)).tocsr()
+    t1 = time.perf_counter()
+    res = milp(c=c, integrality=integrality, bounds=Bounds(lb, ub), constraints=LinearConstraint(A, rlo, rhi))
+    t2 = time.perf_counter()
+    timings = {"compile_sec": t1 - t0, "solve_sec": t2 - t1}
+    if res.status == 2 or res.x is None:  # 2 = infeasible
+        raise Infeasible
+    x = res.x
+    values = {
+        name: x[o[name] : o[name] + size]
+        for name, size in [
+            ("p_imp", T),
+            ("p_exp", T),
+            ("p_ch", T),
+            ("p_dis", T),
+            ("soc", S),
+            ("s_soc_min", S),
+            ("s_imp_cap", T),
+        ]
+    }
+    values["p_peak"] = np.array(x[o["p_peak"]])
+    return values, timings
+
+
+# --------------------------------------------------------------------------- public API
+
+
+def solve_instance(data: dict[str, Any], elastic: bool, solver: str = "highs") -> DispatchResult:
+    """Solve one prepared instance with the chosen backend."""
+    if solver not in SOLVERS:
+        raise ValueError(f"Unknown solver {solver!r}; choose from {SOLVERS}")
+    t0 = time.perf_counter()
+    try:
+        if solver == "scipy":
+            values, timings = _solve_with_scipy(data)
+        else:
+            values, timings = _solve_with_ommx(data, _highs if solver == "highs" else _scip)
+    except Infeasible:
+        result = _infeasible_result(data, elastic, solver, {"total_sec": time.perf_counter() - t0})
+    else:
+        result = _make_result(data, elastic, solver, timings, values)
+    logger.info(
+        "solve finished",
+        extra={
+            "solver": solver,
+            "elastic": elastic,
+            "horizon": data["T"],
+            "status": result.status,
+            "objective_yen": result.objective_yen,
+            "solve_time_sec": round(result.solve_time_sec, 4),
+        },
+    )
+    return result
 
 
 def solve_dispatch(
@@ -255,36 +360,18 @@ def solve_dispatch(
     soc_max_kwh: np.ndarray | None = None,
     grid_import_cap_kw: np.ndarray | None = None,
     auto_recover_infeasible: bool = True,
+    solver: str = "highs",
 ) -> tuple[DispatchResult, DispatchResult | None]:
     """Solve strict dispatch; if infeasible and auto_recover_infeasible=True, solve elastic fallback."""
-    T = len(df_slice)
-    strict_data = make_instance_data(
+    kwargs = dict(
         df_slice=df_slice,
         params=params,
         soc_min_kwh=soc_min_kwh,
         soc_max_kwh=soc_max_kwh,
         grid_import_cap_kw=grid_import_cap_kw,
-        elastic=False,
     )
-
-    # Attempt JijModeling + OMMX if available; otherwise use SciPy HiGHS MILP
-    try:
-        problem = build_jijmodeling_problem(T=T, elastic=False)
-        _ = problem  # Compiled OMMX adapter hook when jijmodeling + ommx adapter are installed
-    except ImportError:
-        pass
-
-    strict_res = _solve_with_scipy_milp(strict_data, elastic=False)
-    if strict_res.status != "INFEASIBLE" or not auto_recover_infeasible:
-        return strict_res, None
-
-    elastic_data = make_instance_data(
-        df_slice=df_slice,
-        params=params,
-        soc_min_kwh=soc_min_kwh,
-        soc_max_kwh=soc_max_kwh,
-        grid_import_cap_kw=grid_import_cap_kw,
-        elastic=True,
-    )
-    recovery_res = _solve_with_scipy_milp(elastic_data, elastic=True)
-    return strict_res, recovery_res
+    strict = solve_instance(make_instance_data(**kwargs, elastic=False), elastic=False, solver=solver)
+    if strict.status != "INFEASIBLE" or not auto_recover_infeasible:
+        return strict, None
+    recovery = solve_instance(make_instance_data(**kwargs, elastic=True), elastic=True, solver=solver)
+    return strict, recovery

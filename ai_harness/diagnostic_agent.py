@@ -30,14 +30,12 @@ def build_operator_brief(
         return "\n".join(lines)
 
     violations = recovery_result.infeasibility_summary(timestamps=timestamps)
-    cost_delta = (
-        f"¥{recovery_result.objective_yen - strict_result.objective_yen:+,.0f}"
-        if (recovery_result.objective_yen is not None and strict_result.objective_yen is not None)
-        else f"¥{recovery_result.objective_yen:,.0f}" if recovery_result.objective_yen is not None else "N/A"
-    )
+    # The strict problem has no solution, so there is no strict cost to compare against;
+    # report the recovery schedule's operational cost (slack penalties excluded).
+    cost = f"¥{recovery_result.objective_yen:,.0f}" if recovery_result.objective_yen is not None else "N/A"
     lines.append(
         f"Elastic Recovery: OPTIMAL ({recovery_result.solve_time_sec:.3f}s) | "
-        f"Recovery Objective: {cost_delta} vs strict | Peak Import: {recovery_result.peak_import_kw:.1f} kW"
+        f"Operational cost (excl. penalties): {cost} | Peak Import: {recovery_result.peak_import_kw:.1f} kW"
     )
     if violations:
         lines.append("Detected constraint conflicts (top items):")
