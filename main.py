@@ -12,11 +12,12 @@ from dataclasses import replace
 from pathlib import Path
 import sys
 
+from ai_harness.llm_translator import LLMUnavailable
 from core_model.data_validation import DataValidationError
 from core_model.evaluation import format_comparison
 from core_model.formulation import BessParams
 from core_model.logging_utils import setup_logging
-from core_model.solver_runner import SOLVERS
+from core_model.solver_runner import SOLVERS, SolverOptions
 from service.pipeline import DEFAULT_DATA, load_data, run_scenario, select_window
 
 
@@ -38,7 +39,23 @@ def parse_args() -> argparse.Namespace:
         "--alert", type=str, default=None, help="Operator alert text to translate into reserve / grid-cap overrides"
     )
     p.add_argument(
+        "--translator",
+        choices=("rules", "llm", "auto"),
+        default="rules",
+        help="How to read --alert: rules (offline regex), llm (Claude), auto (Claude, falling back to rules)",
+    )
+    p.add_argument(
+        "--explain", action="store_true", help="If limits conflict, ask Claude for a short operator explanation"
+    )
+    p.add_argument(
         "--solver", choices=SOLVERS, default="highs", help="Solver backend (default: highs via JijModeling + OMMX)"
+    )
+    p.add_argument("--mip-gap", type=float, default=None, help="Stop when within this relative gap (e.g. 0.01)")
+    p.add_argument("--time-limit", type=float, default=None, help="Solver time limit in seconds")
+    p.add_argument(
+        "--lp-first",
+        action="store_true",
+        help="Exact speed-up: accept the LP relaxation when it is MILP-feasible, else solve the MILP",
     )
     p.add_argument(
         "--no-recovery", action="store_true", help="Do not run the elastic (slack) re-solve when strict is infeasible"
@@ -102,19 +119,29 @@ def main() -> int:
             solver=args.solver,
             auto_recover=not args.no_recovery,
             compare=not args.no_compare,
+            translator=args.translator,
+            solver_options=SolverOptions(
+                mip_rel_gap=args.mip_gap, time_limit_sec=args.time_limit, lp_first=args.lp_first
+            ),
+            explain=args.explain,
         )
     except DataValidationError as exc:
         print(str(exc), file=sys.stderr)
         return 2
+    except LLMUnavailable as exc:
+        print(f"LLM translator unavailable: {exc}. Use --translator auto or rules.", file=sys.stderr)
+        return 3
 
     for w in result.warnings:
         print(f"Note: {w}")
     if result.patch is not None:
-        print("\nAlert overrides:")
+        print(f"\nAlert overrides (read by: {result.translator_source}):")
         for line in result.patch.diff_summary():
             print(f"  - {line}")
 
     print("\n" + result.brief)
+    if result.explanation:
+        print("\nExplanation (Claude):\n" + result.explanation)
 
     if result.comparison is not None:
         print("\nValue vs baselines:")

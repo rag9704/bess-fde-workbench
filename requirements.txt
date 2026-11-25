@@ -6,5 +6,6 @@ jijmodeling>=2.12,<3            # symbolic model
 ommx>=2.9,<3                    # solver-independent instance format
 ommx-highs-adapter>=2.9,<3      # default solver: HiGHS
 ommx-pyscipopt-adapter>=2.9,<3  # alternative solver: SCIP
+anthropic>=2.14,<3              # Claude: alert translation + explanations (optional at runtime)
 fastapi>=0.115                  # HTTP API
 uvicorn>=0.30

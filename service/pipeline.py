@@ -12,11 +12,13 @@ import numpy as np
 import pandas as pd
 
 from ai_harness.diagnostic_agent import build_operator_brief
-from ai_harness.exception_translator import ScheduleOverridePatch, translate_exception_text
+from ai_harness.exception_translator import ScheduleOverridePatch
+from ai_harness.llm_explainer import explain_conflicts
+from ai_harness.llm_translator import TranslatorMode, translate_alert
 from core_model.data_validation import validate_timeseries
 from core_model.evaluation import Schedule, compare_policies, no_battery_schedule, rule_based_schedule
 from core_model.formulation import BessParams
-from core_model.solver_runner import DispatchResult, solve_dispatch
+from core_model.solver_runner import DispatchResult, SolverOptions, solve_dispatch
 
 logger = logging.getLogger(__name__)
 
@@ -33,13 +35,15 @@ class ScenarioResult:
     comparison: pd.DataFrame | None
     brief: str
     warnings: list[str] = field(default_factory=list)
+    translator_source: str | None = None  # "rules" or "llm" when an alert was given
+    explanation: str | None = None  # optional Claude-written operator explanation
 
     @property
     def final(self) -> DispatchResult | None:
         """The schedule to act on: strict if feasible, else the elastic recovery (if any)."""
-        if self.strict.status == "OPTIMAL":
+        if self.strict.usable:
             return self.strict
-        if self.recovery is not None and self.recovery.status == "OPTIMAL":
+        if self.recovery is not None and self.recovery.usable:
             return self.recovery
         return None
 
@@ -84,22 +88,35 @@ def run_scenario(
     solver: str = "highs",
     auto_recover: bool = True,
     compare: bool = True,
+    translator: TranslatorMode = "rules",
+    solver_options: SolverOptions | None = None,
+    explain: bool = False,
+    llm_client=None,
 ) -> ScenarioResult:
     warnings = validate_timeseries(window, expected_step_hours=params.dt_hours)
     T = len(window)
     timestamps = window["timestamp"].astype(str).tolist()
 
     patch = None
+    source = None
     soc_min = grid_cap = None
     if alert:
-        patch = translate_exception_text(alert, capacity_kwh=params.capacity_kwh)
+        patch, source = translate_alert(
+            alert,
+            capacity_kwh=params.capacity_kwh,
+            horizon_hours=T,
+            horizon_start=timestamps[0],
+            mode=translator,
+            client=llm_client,
+        )
         if patch.end_soc_min_kwh is not None:
-            params = replace(params, end_soc_min_kwh=patch.end_soc_min_kwh)
+            # Overrides may only tighten limits, never loosen them.
+            params = replace(params, end_soc_min_kwh=max(params.end_soc_min_kwh, patch.end_soc_min_kwh))
         soc_min_full, grid_cap = patch.apply(
             T, params.default_soc_min_frac * params.capacity_kwh, params.grid_import_cap_kw
         )
         soc_min = soc_min_full
-        logger.info("alert translated", extra={"alert": alert, "overrides": patch.diff_summary()})
+        logger.info("alert translated", extra={"alert": alert, "source": source, "overrides": patch.diff_summary()})
 
     strict, recovery = solve_dispatch(
         window,
@@ -108,6 +125,7 @@ def run_scenario(
         grid_import_cap_kw=grid_cap,
         auto_recover_infeasible=auto_recover,
         solver=solver,
+        options=solver_options,
     )
 
     result = ScenarioResult(
@@ -119,7 +137,16 @@ def run_scenario(
         comparison=None,
         brief=build_operator_brief(strict, recovery, timestamps),
         warnings=warnings,
+        translator_source=source,
     )
+    if explain and recovery is not None:
+        result.explanation = explain_conflicts(
+            alert=alert,
+            overrides=patch.diff_summary() if patch else [],
+            violations=recovery.infeasibility_summary(timestamps),
+            params=params,
+            client=llm_client,
+        )
 
     final = result.final
     if compare and patch is not None:

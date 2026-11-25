@@ -1,0 +1,30 @@
+{"id": "typhoon-cap-en", "text": "Typhoon warning, cap grid import at 300 kW", "expected": {"soc_min": [[0, 23, 1500]], "grid_cap": [[0, 23, 300]], "end_soc_min_kwh": null}, "tags": "storm policy + cap"}
+{"id": "reserve-pct-window", "text": "reserve 80% from 14 to 20", "expected": {"soc_min": [[14, 20, 1600]], "grid_cap": [], "end_soc_min_kwh": null}, "tags": "basic"}
+{"id": "pct-before-keyword", "text": "Hold 90% reserve", "expected": {"soc_min": [[0, 23, 1800]], "grid_cap": [], "end_soc_min_kwh": null}, "tags": "number before keyword"}
+{"id": "reserve-kwh", "text": "reserve 1200 kWh", "expected": {"soc_min": [[0, 23, 1200]], "grid_cap": [], "end_soc_min_kwh": null}, "tags": "basic"}
+{"id": "transformer-limit", "text": "transformer limit 500kw", "expected": {"soc_min": [], "grid_cap": [[0, 23, 500]], "end_soc_min_kwh": null}, "tags": "basic"}
+{"id": "jp-juden-cap", "text": "受電 600kW", "expected": {"soc_min": [], "grid_cap": [[0, 23, 600]], "end_soc_min_kwh": null}, "tags": "japanese basic"}
+{"id": "jp-typhoon-reserve", "text": "台風接近のため、蓄電池残量を80%以上に保ってください", "expected": {"soc_min": [[0, 23, 1600]], "grid_cap": [], "end_soc_min_kwh": null}, "tags": "japanese explicit reserve beats storm policy"}
+{"id": "jp-typhoon-only", "text": "台風 警報", "expected": {"soc_min": [[0, 23, 1500]], "grid_cap": [], "end_soc_min_kwh": null}, "tags": "japanese storm policy"}
+{"id": "maintenance-window-cap", "text": "Grid maintenance 13:00 to 17:00: limit import to 400 kW", "expected": {"soc_min": [], "grid_cap": [[13, 17, 400]], "end_soc_min_kwh": null}, "tags": "clock window"}
+{"id": "jp-outage-window-reserve", "text": "停電リスクあり。14時から18時まで予備率70%を確保", "expected": {"soc_min": [[14, 18, 1400]], "grid_cap": [], "end_soc_min_kwh": null}, "tags": "japanese window + percent"}
+{"id": "soc-between-clock", "text": "Keep SoC at least 50% between 09:00 and 12:00", "expected": {"soc_min": [[9, 12, 1000]], "grid_cap": [], "end_soc_min_kwh": null}, "tags": "clock window"}
+{"id": "dr-event-cap", "text": "Demand response event 17:00-20:00: keep grid import below 350 kW", "expected": {"soc_min": [], "grid_cap": [[17, 20, 350]], "end_soc_min_kwh": null}, "tags": "clock window cap"}
+{"id": "mw-units", "text": "Contract demand limit 0.8 MW today", "expected": {"soc_min": [], "grid_cap": [[0, 23, 800]], "end_soc_min_kwh": null}, "tags": "unit conversion"}
+{"id": "end-soc-pct", "text": "End the day with the battery at least 70% full", "expected": {"soc_min": [], "grid_cap": [], "end_soc_min_kwh": 1400.0}, "tags": "end-of-horizon requirement"}
+{"id": "storm-window", "text": "Storm expected from 15 to 22.", "expected": {"soc_min": [[15, 22, 1500]], "grid_cap": [], "end_soc_min_kwh": null}, "tags": "storm policy in window"}
+{"id": "nothing", "text": "All systems normal today", "expected": {"soc_min": [], "grid_cap": [], "end_soc_min_kwh": null}, "tags": "no-op"}
+{"id": "out-of-scope-price", "text": "Please increase the export price to 12 yen", "expected": {"soc_min": [], "grid_cap": [], "end_soc_min_kwh": null}, "tags": "out-of-scope request must not create overrides"}
+{"id": "outage-explicit-reserve", "text": "Outage risk tonight: reserve 1500 kWh from 18 to 23", "expected": {"soc_min": [[18, 23, 1500]], "grid_cap": [], "end_soc_min_kwh": null}, "tags": "explicit reserve, no storm default"}
+{"id": "over-capacity-clamp", "text": "Reserve 2500 kWh", "expected": {"soc_min": [[0, 23, 2000]], "grid_cap": [], "end_soc_min_kwh": null}, "tags": "guardrail: clamp to capacity"}
+{"id": "hours-with-space", "text": "SoC 40% hours 6-10", "expected": {"soc_min": [[6, 10, 800]], "grid_cap": [], "end_soc_min_kwh": null}, "tags": "window syntax"}
+{"id": "jp-cap-window", "text": "受電上限を13時〜16時の間450kWに制限", "expected": {"soc_min": [], "grid_cap": [[13, 16, 450]], "end_soc_min_kwh": null}, "tags": "japanese window cap"}
+{"id": "lightning-window", "text": "Lightning warning (雷注意報) for the afternoon, 12:00-18:00", "expected": {"soc_min": [[12, 18, 1500]], "grid_cap": [], "end_soc_min_kwh": null}, "tags": "storm-like event, window"}
+{"id": "typhoon-explicit-pct", "text": "Typhoon: hold reserve 60%", "expected": {"soc_min": [[0, 23, 1200]], "grid_cap": [], "end_soc_min_kwh": null}, "tags": "explicit reserve beats storm policy"}
+{"id": "two-windows", "text": "Cap import at 700 kW from 10 to 15 and keep reserve 30% from 0 to 6", "expected": {"soc_min": [[0, 6, 600]], "grid_cap": [[10, 15, 700]], "end_soc_min_kwh": null}, "tags": "two different windows"}
+{"id": "jp-demand-control", "text": "デマンド制御：最大受電電力を500kWに抑えてください", "expected": {"soc_min": [], "grid_cap": [[0, 23, 500]], "end_soc_min_kwh": null}, "tags": "japanese cap"}
+{"id": "end-soc-kwh", "text": "Ensure at least 1000 kWh remains at midnight (end of horizon)", "expected": {"soc_min": [], "grid_cap": [], "end_soc_min_kwh": 1000.0}, "tags": "end-of-horizon requirement"}
+{"id": "mw-hours-space", "text": "No grid import above 1 MW during hours 8 to 20", "expected": {"soc_min": [], "grid_cap": [[8, 20, 1000]], "end_soc_min_kwh": null}, "tags": "units + window"}
+{"id": "rain-no-action", "text": "Heavy rain alert but no action needed", "expected": {"soc_min": [], "grid_cap": [], "end_soc_min_kwh": null}, "tags": "judgement: explicit no action"}
+{"id": "reserve-85", "text": "Reserve 85%", "expected": {"soc_min": [[0, 23, 1700]], "grid_cap": [], "end_soc_min_kwh": null}, "tags": "basic"}
+{"id": "jp-cap-and-end", "text": "システム点検のため10時から12時は受電を200kW以下にしてください。また終了時の残量は1200kWh以上", "expected": {"soc_min": [], "grid_cap": [[10, 12, 200]], "end_soc_min_kwh": 1200.0}, "tags": "japanese multi-request"}

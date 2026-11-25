@@ -17,10 +17,11 @@ from fastapi.responses import RedirectResponse
 import pandas as pd
 from pydantic import BaseModel, Field
 
+from ai_harness.llm_translator import LLMUnavailable
 from core_model.data_validation import DataValidationError
 from core_model.formulation import BessParams
 from core_model.logging_utils import setup_logging
-from core_model.solver_runner import SOLVERS
+from core_model.solver_runner import SOLVERS, SolverOptions
 from service.pipeline import DEFAULT_DATA, load_data, run_scenario, select_window
 
 setup_logging()
@@ -77,10 +78,18 @@ class OptimizeRequest(BaseModel):
     auto_recover: bool = True
     compare: bool = True
     include_schedule: bool = True
+    translator: Literal["rules", "llm", "auto"] = Field(
+        "rules", description="How to read `alert`: rules (offline), llm (Claude), auto (Claude, fallback to rules)"
+    )
+    explain: bool = Field(False, description="If limits conflict, add a Claude-written operator explanation")
+    mip_rel_gap: float | None = Field(None, ge=0, le=1, description="Accept a schedule within this relative gap")
+    time_limit_sec: float | None = Field(None, gt=0, le=300, description="Solver time limit")
+    lp_first: bool = Field(False, description="Exact speed-up: use the LP relaxation when it is MILP-feasible")
 
 
 class OptimizeResponse(BaseModel):
-    status: Literal["OPTIMAL", "RECOVERED", "INFEASIBLE"]
+    status: Literal["OPTIMAL", "FEASIBLE", "RECOVERED", "INFEASIBLE", "NO_SOLUTION"]
+    mip_gap: float | None = None
     backend: str
     horizon: dict
     objective_yen: float | None
@@ -90,6 +99,8 @@ class OptimizeResponse(BaseModel):
     overrides: list[str] = []
     violations: list[str] = []
     warnings: list[str] = []
+    translator_source: str | None = None
+    explanation: str | None = None
     comparison: list[dict] | None = None
     schedule: list[dict] | None = None
 
@@ -150,17 +161,24 @@ def optimize(req: OptimizeRequest) -> OptimizeResponse:
             solver=req.solver,
             auto_recover=req.auto_recover,
             compare=req.compare,
+            translator=req.translator,
+            solver_options=SolverOptions(
+                mip_rel_gap=req.mip_rel_gap, time_limit_sec=req.time_limit_sec, lp_first=req.lp_first
+            ),
+            explain=req.explain,
         )
     except DataValidationError as exc:
         raise HTTPException(422, {"message": "Input data failed validation", "issues": exc.issues}) from exc
+    except LLMUnavailable as exc:
+        raise HTTPException(503, f"LLM translator unavailable: {exc}. Use translator='auto' or 'rules'.") from exc
 
     final = result.final
-    if result.strict.status == "OPTIMAL":
-        status = "OPTIMAL"
+    if result.strict.usable:
+        status = result.strict.status  # OPTIMAL, or FEASIBLE when a time limit stopped the solver
     elif final is not None:
         status = "RECOVERED"
     else:
-        status = "INFEASIBLE"
+        status = result.strict.status  # INFEASIBLE or NO_SOLUTION
 
     timestamps = window["timestamp"].astype(str).tolist()
     comparison = None
@@ -178,6 +196,7 @@ def optimize(req: OptimizeRequest) -> OptimizeResponse:
         backend=result.strict.backend,
         horizon={"start": timestamps[0], "end": timestamps[-1], "hours": len(window)},
         objective_yen=final.objective_yen if final else None,
+        mip_gap=final.mip_gap if final else None,
         peak_import_kw=final.peak_import_kw if final else None,
         solve_time_sec=round(
             result.strict.solve_time_sec + (result.recovery.solve_time_sec if result.recovery else 0), 4
@@ -186,6 +205,8 @@ def optimize(req: OptimizeRequest) -> OptimizeResponse:
         overrides=result.patch.diff_summary() if result.patch else [],
         violations=result.recovery.infeasibility_summary(timestamps) if result.recovery else [],
         warnings=result.warnings,
+        translator_source=result.translator_source,
+        explanation=result.explanation,
         comparison=comparison,
         schedule=schedule,
     )

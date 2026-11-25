@@ -1,6 +1,5 @@
 from dataclasses import dataclass, field
 import re
-from typing import Any
 
 import numpy as np
 
@@ -56,14 +55,12 @@ class ScheduleOverridePatch:
 def translate_exception_text(
     text: str,
     capacity_kwh: float = 2000.0,
-    llm_callable: Any | None = None,
 ) -> ScheduleOverridePatch:
-    """Translate an operator alert into a structured override patch.
+    """Translate an operator alert into a structured override patch with regex/keyword rules.
 
-    Uses deterministic regex/keyword parsing by default; if `llm_callable(prompt: str) -> str`
-    is supplied, it can augment or refine edge cases while keeping output typed and bounded.
+    Deterministic, free and offline. For alerts these rules cannot read, see
+    `ai_harness.llm_translator.translate_alert` (Claude, with this parser as fallback).
     """
-    _ = llm_callable  # Hook for optional LLM client integration
     patch = ScheduleOverridePatch()
     lower = text.lower()
 
@@ -82,7 +79,12 @@ def translate_exception_text(
         kwh_val = round(capacity_kwh * (pct / 100.0), 1)
         patch.soc_min_overrides.append((start_h, end_h, kwh_val))
     elif kwh_match:
-        patch.soc_min_overrides.append((start_h, end_h, float(kwh_match.group(1))))
+        kwh_val = float(kwh_match.group(1))
+        if kwh_val > capacity_kwh:
+            # A reserve above capacity can never be met and would make every schedule infeasible.
+            patch.notes.append(f"Reserve {kwh_val:.0f} kWh exceeds capacity; clamped to {capacity_kwh:.0f} kWh")
+            kwh_val = capacity_kwh
+        patch.soc_min_overrides.append((start_h, end_h, kwh_val))
     elif any(k in lower for k in ["typhoon", "storm", "台風", "警報", "outage", "停電"]):
         # Safe storm/outage default: 75% reserve over window
         patch.soc_min_overrides.append((start_h, end_h, round(0.75 * capacity_kwh, 1)))
