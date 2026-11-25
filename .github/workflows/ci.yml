@@ -32,6 +32,10 @@ jobs:
           cache-dependency-path: requirements*.txt
       - run: pip install -r requirements-dev.txt
       - run: pytest
+      - name: Model verification report
+        run: python verify.py --quick
+      - name: Alert translator eval (rules baseline, offline)
+        run: python -m ai_harness.evals.run_alert_eval --mode rules
       - name: CLI smoke test
         run: python main.py --hours 24 --out output/schedule.csv
 
