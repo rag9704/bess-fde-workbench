@@ -1,0 +1,6 @@
+numpy>=2.0
+pandas>=2.0
+scipy>=1.11  # milp (HiGHS) solver
+
+# Optional: JijModeling formulation (not required; SciPy HiGHS is used to solve)
+# jijmodeling
