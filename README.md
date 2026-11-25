@@ -1,131 +1,151 @@
 # BESS FDE Workbench
 
-An hourly **battery energy storage (BESS) dispatch optimizer** for a commercial
-behind-the-meter site with rooftop solar, built on real Japanese grid data
-(TEPCO area demand/solar + JEPX Tokyo spot prices). It also includes a small
-"operator harness" that turns plain-text alerts (e.g. *"typhoon warning, cap grid
-import at 300 kW"*) into model constraints and explains infeasible results in
-plain language.
+Cost-optimal hourly dispatch for a **commercial solar + battery (BESS) site in Japan**, built on real
+TEPCO area demand/solar data and JEPX Tokyo spot prices.
+
+- **Model:** a mixed-integer linear program written once in **JijModeling**, compiled to an **OMMX** instance and
+  solved with **HiGHS** or **SCIP**. An independent SciPy model is kept as a cross-check.
+- **Measured value:** every schedule is compared with *no battery* and with a *rule-based* operating policy
+  using the same cost function.
+- **Operations harness:** turns operator alerts ("typhoon warning, cap grid import at 300 kW") into constraints.
+  When the limits can't all be met, it reports *which* limit breaks, *when*, and *by how much*.
+- **Production-ready:** CLI, FastAPI service, Docker image, input checks, structured logging, 50+ tests, GitHub Actions CI.
+
+**Results on April 2026 data** (2,000 kWh / 500 kW battery, 600 kW PV, 1,000 kW peak load):
+
+| Horizon | No battery | Rule-based | **Optimized** | Optimized saving | Peak import |
+|---|---|---|---|---|---|
+| 1 day | ¥2,093,372 | ¥2,069,871 (−1.1%) | **¥1,860,918** | **−11.1%** | 986 → 827 kW |
+| 1 week | ¥5,408,155 | ¥5,279,127 (−2.4%) | **¥5,044,001** | **−6.7%** | 986 → 799 kW |
+| 1 month | ¥16,031,682 | ¥15,334,758 (−4.3%) | **¥15,033,602** | **−6.2%** | 986 → 813 kW |
+
+Most of the value comes from **peak shaving**: the rule-based policy never lowers the demand-charge peak,
+while the optimizer cuts it by about 17–19%.
 
 ---
 
-## What problem it solves
+## 1. The problem
 
-A site has electricity **load**, **solar generation**, a **battery** and a
-**grid connection**. Every hour, someone has to decide:
-
-- how much to import from / export to the grid,
-- when to charge or discharge the battery,
-
-so that the total cost is as low as possible, while respecting physical and
-contractual limits.
-
-The cost being minimized over the horizon is:
+A site has electricity **load**, **solar generation**, a **battery** and a **grid connection**. For every
+hour, decide how much to **import / export** and when to **charge / discharge**, to minimize:
 
 ```
-  Σ_t  import_price[t] · grid_import[t]          (energy bought)
-- Σ_t  export_price[t] · grid_export[t]          (energy sold)
-+ Σ_t  degradation_cost · (charge[t] + discharge[t])   (battery wear)
-+ peak_demand_charge · max_t grid_import[t]      (demand / kW charge)
+  Σ_t import_price[t] · import[t] · dt          energy bought
+− Σ_t export_price[t] · export[t] · dt          energy sold
++ Σ_t wear_cost · (charge[t] + discharge[t]) · dt   battery degradation
++ demand_charge · max_t import[t]               peak (kW) demand charge
 ```
 
-Subject to:
+subject to:
 
 | Constraint | Meaning |
 |---|---|
-| Power balance | `load + charge + export = solar + discharge + import` every hour |
-| SoC dynamics | `soc[t+1] = soc[t] + η_ch·charge − discharge/η_dis` |
-| Initial / terminal SoC | starts at `init_soc_kwh`, ends ≥ `end_soc_min_kwh` |
-| SoC bounds | `soc_min[t] ≤ soc[t] ≤ capacity` (default floor = 10% of capacity) |
-| Power limits | charge ≤ max_charge_kw, discharge ≤ max_discharge_kw, export ≤ export cap, import ≤ import cap |
-| No simultaneous charge + discharge | enforced with a binary variable per hour (makes it a MILP) |
+| `power_balance` | `load + charge + export = solar + discharge + import` every hour |
+| `soc_dynamics` | `soc[t+1] = soc[t] + η_ch·charge·dt − discharge·dt/η_dis` |
+| `soc_init_eq`, `soc_end_floor` | start at `init_soc_kwh`, finish at or above `end_soc_min_kwh` |
+| `soc_min_reserve`, `soc_upper_bound` | reserve floor (default 10%) and ceiling at every state |
+| `charge_mode_limit`, `discharge_mode_limit` | a binary `z_ch[t]` prevents charging and discharging in the same hour |
+| `grid_import_cap`, export bound | grid connection limits |
+| `peak_import_def` | `p_peak ≥ import[t]` (linearizes the max for the demand charge) |
 
-This is solved as a **mixed-integer linear program** using SciPy's `milp`
-(HiGHS solver).
+### Strict and elastic in one model
 
-### Infeasibility recovery
+The slack variables `s_soc_min` and `s_imp_cap` are always in the model, and their upper bound is a parameter:
 
-If the hard limits can't all be satisfied (e.g. an alert demands a 75% battery
-reserve **and** a 300 kW import cap on a 700 kW-load day), the strict model is
-infeasible. The runner then automatically re-solves an **elastic** version where
-the SoC floor and import cap may be violated at a heavy penalty
-(¥10,000/kWh). The slack values tell you **exactly which limit broke, at what
-time, and by how much** — instead of just "infeasible".
+- **strict:** `slack_ub = 0`, so every limit is hard.
+- **elastic:** `slack_ub` is large and slack costs ¥10,000/kWh, so the solver breaks limits only when it has to.
+  The non-zero slacks show exactly where the scenario is infeasible.
+
+Because the horizon length `T` is also a parameter, **the model is built once** (`build_problem()`, cached) and
+reused for every site, horizon and scenario. Only the instance data changes.
 
 ---
 
-## Project structure
+## 2. Project structure
 
 ```
 bess-fde-workbench/
-├── main.py                          # CLI entry point (start here)
-├── requirements.txt
+├── main.py                        # CLI
 ├── core_model/
-│   ├── formulation.py               # BessParams defaults, JijModeling formulation, input builder
-│   └── solver_runner.py             # SciPy HiGHS MILP solver, strict + elastic fallback, DispatchResult
+│   ├── formulation.py             # BessParams + JijModeling model + instance data builder
+│   ├── solver_runner.py           # backends (OMMX/HiGHS, OMMX/SCIP, SciPy reference), strict → elastic fallback
+│   ├── evaluation.py              # cost breakdown, no-battery & rule-based baselines, comparison table
+│   ├── data_validation.py         # input checks (columns, gaps, duplicates, NaN, negatives)
+│   └── logging_utils.py           # text or JSON structured logs
 ├── ai_harness/
-│   ├── exception_translator.py      # Alert text  ->  SoC-floor / import-cap overrides
-│   ├── diagnostic_agent.py          # Results     ->  short operator summary
-│   └── .claude/skills/bess-model-verifier/SKILL.md   # Claude Code skill: model verification checklist
-└── data/
-    ├── prepare_japan_grid_data.py   # Builds the hourly site dataset from raw data
-    ├── april_2026_hourly.csv        # Ready-to-use dataset (720 h, April 2026)
-    └── raw/
-        ├── eria_jukyu_202604_03.csv # TEPCO area supply/demand (MW, 5-min/30-min)
-        └── spot_summary_2026.csv    # JEPX spot prices (30-min slots, cp932)
+│   ├── exception_translator.py    # alert text → reserve / import-cap overrides
+│   ├── diagnostic_agent.py        # results → operator summary
+│   └── .claude/skills/bess-model-verifier/SKILL.md   # Claude Code skill: how to verify model changes
+├── service/
+│   ├── pipeline.py                # validate → translate alert → solve → compare (shared by CLI and API)
+│   └── api.py                     # FastAPI app: GET /health, POST /optimize
+├── data/
+│   ├── prepare_japan_grid_data.py # raw TEPCO + JEPX → hourly site CSV
+│   ├── april_2026_hourly.csv      # ready-to-use dataset (720 h)
+│   └── raw/                       # TEPCO eria_jukyu + JEPX spot_summary
+├── tests/                         # pytest suite
+├── Dockerfile, .github/workflows/ci.yml, pyproject.toml, requirements*.txt
+```
+
+```
+ CSV / API request
+        │
+        ▼
+ data_validation ──► exception_translator (optional alert)
+        │                       │ overrides
+        ▼                       ▼
+ make_instance_data ──► JijModeling problem.eval() ──► OMMX Instance ──► HiGHS / SCIP
+                                                                            │
+         strict infeasible? ──► same model, elastic slack bounds ◄──────────┘
+        │
+        ▼
+ evaluation (vs baselines) ──► diagnostic_agent brief ──► CLI output / JSON response
 ```
 
 ---
 
-## Setup
+## 3. Setup
 
-Requires Python 3.10+.
+Python 3.12+ (tested on 3.12–3.14).
 
 ```bash
 cd bess-fde-workbench
-python3 -m venv .venv          # skip if .venv already exists
+python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements-dev.txt     # or requirements.txt for runtime only
 ```
-
-`jijmodeling` is optional. If it's installed the formulation is built with it,
-but solving always uses SciPy HiGHS.
 
 ---
 
-## How to run
-
-All commands are run from the project root with the venv active.
-
-### 1. Basic run (first 24 hours of the dataset)
+## 4. Command line
 
 ```bash
-python main.py
-```
-
-```
-Horizon: 2026-04-01 00:00:00 -> 2026-04-01 23:00:00 (24 h) | Battery 2000 kWh / 500 kW
-
-Status: OPTIMAL (scipy.optimize.milp (HiGHS), 0.104s) | Objective: ¥1,733,925 | Peak Import: 769.4 kW
-Energy: Import 18,370 kWh, Export 0 kWh, Charge 1,915 kWh, Discharge 752 kWh
-```
-
-### 2. Choose a window
-
-```bash
-python main.py --start 2026-04-07 --hours 168      # one week
-python main.py --start "2026-04-15 06:00" --hours 12
-python main.py --hours 720                          # whole month (slower: binaries scale with T)
-```
-
-### 3. Try a different battery / site
-
-```bash
+python main.py                                        # first 24 h
+python main.py --start 2026-04-07 --hours 168         # one week
+python main.py --hours 720                            # whole month (~1.5 s)
+python main.py --solver scip                          # highs (default) | scip | scipy
 python main.py --capacity-kwh 3000 --max-charge-kw 750 --max-discharge-kw 750
-python main.py --grid-import-cap-kw 900 --peak-charge-yen-kw 2000
+python main.py --hours 168 --out output/week.csv      # save the hourly schedule
+python main.py --log-level INFO --log-json            # structured logs to stderr
 ```
 
-### 4. Apply an operator alert
+Example output:
+
+```
+Horizon: 2026-04-01 00:00:00 -> 2026-04-01 23:00:00 (24 h) | Battery 2000 kWh / 500 kW | Solver: highs
+
+Status: OPTIMAL (JijModeling + OMMX / HiGHS, 0.297s) | Objective: ¥1,854,251 | Peak Import: 827.2 kW
+Energy: Import 19,473 kWh, Export 0 kWh, Charge 1,100 kWh, Discharge 1,160 kWh
+
+Value vs baselines:
+Policy                                 Cost (adj.)   Peak kW    Demand chg       Savings       %
+-----------------------------------------------------------------------------------------------
+No battery                              ¥2,093,372     986.5    ¥1,381,100            ¥0    0.0%
+Rule-based (cheap/expensive hours)      ¥2,069,871     986.5    ¥1,381,100       ¥23,500    1.1%
+Optimized (MILP)                        ¥1,860,918     827.2    ¥1,158,011      ¥232,454   11.1%
+```
+
+### Operator alerts
 
 ```bash
 python main.py --alert "Typhoon warning, cap grid import at 300 kW"
@@ -137,144 +157,201 @@ Alert overrides:
   - Grid import cap <= 300.0 kW for hour indices [0..23]
   - Applied 75% storm/outage reserve heuristic
 
-Status: STRICT INFEASIBLE (0.002s) — hard constraints conflicted under current inputs.
-Elastic Recovery: OPTIMAL (0.164s) | Recovery Objective: ¥2,651,241 vs strict | Peak Import: 1406.8 kW
+Status: STRICT INFEASIBLE (0.303s) — hard constraints conflicted under current inputs.
+Elastic Recovery: OPTIMAL (0.254s) | Operational cost (excl. penalties): ¥2,383,220 | Peak Import: 1192.0 kW
 Detected constraint conflicts (top items):
-  - Grid import cap exceeded by 54.6 kW at 2026-04-01 01:00:00
-  - Grid import cap exceeded by 841.4 kW at 2026-04-01 03:00:00
+  - Grid import cap exceeded by 892.0 kW at 2026-04-01 00:00:00
+  - Grid import cap exceeded by 394.9 kW at 2026-04-01 01:00:00
   ...
 ```
 
-Add `--no-recovery` to skip the elastic re-solve.
+With an alert the baseline comparison is skipped, because the baselines don't model alert overrides and
+the comparison wouldn't be like-for-like.
 
-### 5. Save the hourly schedule
+| You write | Effect |
+|---|---|
+| `reserve 80%`, `soc 60%` | SoC floor = % of capacity |
+| `reserve 1200 kWh` | SoC floor in kWh |
+| `typhoon`, `storm`, `outage`, `台風`, `警報`, `停電` (no number) | SoC floor = 75% of capacity |
+| `cap grid import at 300 kW`, `transformer limit 500kw`, `受電 600kW` | import cap |
+| `from 14 to 20`, `at 13:00 to 17:00`, `hours14-20` | hour window (index into the horizon; default 0–23) |
+
+Known gaps, tracked as `xfail` tests: `90% reserve` (number before the keyword) and `hours 14-20` (with a
+space) are not parsed.
+
+### All options
+
+| Option | Default | |
+|---|---|---|
+| `--data` | `data/april_2026_hourly.csv` | hourly input CSV |
+| `--start` / `--hours` | first row / 24 | horizon |
+| `--alert` | – | operator alert text |
+| `--solver` | `highs` | `highs`, `scip`, `scipy` |
+| `--no-recovery` / `--no-compare` | off | skip elastic re-solve / baselines |
+| `--out` | – | write schedule CSV |
+| `--log-level` / `--log-json` | `WARNING` / text | also via `LOG_LEVEL`, `LOG_FORMAT=json` |
+| `--capacity-kwh` | 2000 | battery energy |
+| `--max-charge-kw` / `--max-discharge-kw` | 500 / 500 | battery power |
+| `--init-soc-kwh` / `--end-soc-min-kwh` | 1000 / 800 | start SoC / minimum end SoC |
+| `--grid-import-cap-kw` / `--grid-export-cap-kw` | 1200 / 400 | grid limits |
+| `--peak-charge-yen-kw` | 1400 | demand charge |
+| `--degradation-yen-kwh` | 2.0 | wear cost per kWh throughput |
+
+---
+
+## 5. HTTP API
 
 ```bash
-python main.py --start 2026-04-07 --hours 168 --out output/week_schedule.csv
+uvicorn service.api:app --reload
+# interactive docs: http://127.0.0.1:8000/docs
 ```
 
-Columns: `timestamp, load_kw, solar_kw, import_price_yen_kwh, grid_import_kw,
-grid_export_kw, charge_kw, discharge_kw, soc_end_kwh, slack_import_kw, slack_soc_kwh`.
-(Slack columns are non-zero only when the elastic recovery was used.)
+```bash
+curl -s -X POST localhost:8000/optimize -H 'content-type: application/json' -d '{
+  "start": "2026-04-07", "hours": 168,
+  "battery": {"capacity_kwh": 3000, "max_charge_kw": 750},
+  "solver": "highs",
+  "include_schedule": false
+}'
+```
 
-### All CLI options
-
-| Option | Default | Description |
-|---|---|---|
-| `--data` | `data/april_2026_hourly.csv` | Hourly input CSV |
-| `--start` | first row | Start timestamp |
-| `--hours` | `24` | Horizon length |
-| `--alert` | – | Operator alert text |
-| `--no-recovery` | off | Disable elastic fallback |
-| `--out` | – | Write schedule CSV |
-| `--capacity-kwh` | 2000 | Battery energy capacity |
-| `--max-charge-kw` / `--max-discharge-kw` | 500 / 500 | Battery power limits |
-| `--init-soc-kwh` / `--end-soc-min-kwh` | 1000 / 800 | Start SoC / minimum end SoC |
-| `--grid-import-cap-kw` / `--grid-export-cap-kw` | 1200 / 400 | Grid connection limits |
-| `--peak-charge-yen-kw` | 1400 | Demand charge per kW of peak import |
-| `--degradation-yen-kwh` | 2.0 | Wear cost per kWh charged or discharged |
-
-Efficiencies (94% / 94%), slack penalty and `dt` are set in `BessParams`
-(`core_model/formulation.py`).
-
----
-
-## Writing alerts
-
-`translate_exception_text` uses keyword/regex rules (no LLM call by default):
-
-| What you write | Effect |
+| Field | Description |
 |---|---|
-| `reserve 80%` / `soc 60%` | SoC floor = that % of capacity |
-| `reserve 1200 kWh` | SoC floor in kWh |
-| `typhoon`, `storm`, `outage`, `台風`, `警報`, `停電` (with no % / kWh given) | SoC floor = 75% of capacity |
-| `cap grid import at 300 kW`, `transformer limit 500kw`, `受電 600kW` | Import cap for the window |
-| `from 14 to 20`, `at 13:00 to 17:00`, `hours14-20` | Hour window (index within the horizon). Default: 0–23 |
+| `start`, `hours` (1–744) | horizon within the data |
+| `series` | optional: your own rows `{timestamp, load_kw, solar_kw, import_price_yen_kwh, export_price_yen_kwh}` |
+| `battery` | any `BessParams` field; omitted fields use defaults |
+| `alert` | operator alert text |
+| `solver`, `auto_recover`, `compare`, `include_schedule` | as in the CLI |
 
-Rule tips:
-- Put the number **after** the keyword: `reserve 90%` works, `90% reserve` does not.
-- The hour window is an **index into the horizon** (0 = first hour of `--start`),
-  not a clock time, and defaults to 0–23 even for longer horizons.
-- `"hours 14-20"` (with a space) and a bare `"13:00 to 17:00"` are not recognised;
-  use `from 14 to 20`.
+The response contains `status` (`OPTIMAL` / `RECOVERED` / `INFEASIBLE`), `objective_yen`, `peak_import_kw`,
+`brief`, `overrides`, `violations`, `comparison` (cost breakdown per policy) and `schedule` (hourly rows).
+
+If the data fails the input checks, the API returns **422 with every issue found**, not just the first:
+
+```json
+{"detail": {"message": "Input data failed validation",
+            "issues": ["1 gap(s)/irregular step(s) (expected 1.0 h), first at 2026-01-01 03:00:00",
+                       "Column 'load_kw' has 1 negative value(s)"]}}
+```
+
+Every response carries an `x-request-id` header. With `LOG_LEVEL=INFO` each request and solve is logged
+with its duration, solver, horizon, status and objective.
+
+### Docker
+
+```bash
+docker build -t bess-optimizer .
+docker run -p 8000:8000 bess-optimizer       # JSON logs, honours $PORT (Cloud Run compatible)
+```
 
 ---
 
-## Using it from Python
+## 6. Using it from Python
 
 ```python
-import pandas as pd
 from core_model.formulation import BessParams
-from core_model.solver_runner import solve_dispatch
-from ai_harness.exception_translator import translate_exception_text
-from ai_harness.diagnostic_agent import build_operator_brief
+from service.pipeline import load_data, select_window, run_scenario
 
-df = pd.read_csv("data/april_2026_hourly.csv", parse_dates=["timestamp"])
-window = df.iloc[:24]
-params = BessParams(capacity_kwh=2500)
+window = select_window(load_data(), start="2026-04-07", hours=168)
+result = run_scenario(window, BessParams(capacity_kwh=2500), solver="highs")
 
-strict, recovery = solve_dispatch(window, params)
-print(build_operator_brief(strict, recovery, window["timestamp"].astype(str).tolist()))
-
-# Arrays per hour
-strict.p_imp_kw, strict.p_ch_kw, strict.p_dis_kw, strict.soc_kwh  # soc has T+1 entries
+print(result.brief)
+print(result.comparison[["adjusted_cost_yen", "peak_import_kw", "savings_pct"]])
+schedule = result.schedule_frame()  # pandas DataFrame, one row per hour
 ```
 
-With an alert:
+Lower level:
 
 ```python
-patch = translate_exception_text("reserve 80% from 14 to 20", capacity_kwh=params.capacity_kwh)
-soc_min, grid_cap = patch.apply(len(window), 0.10 * params.capacity_kwh, params.grid_import_cap_kw)
-strict, recovery = solve_dispatch(window, params, soc_min_kwh=soc_min[:len(window)], grid_import_cap_kw=grid_cap)
+from core_model.formulation import build_problem, make_instance_data
+from core_model.solver_runner import solve_dispatch
+
+problem = build_problem()  # jm.Problem (renders as LaTeX in Jupyter)
+instance = problem.eval(make_instance_data(window, BessParams()))  # ommx.v1.Instance
+strict, recovery = solve_dispatch(window, BessParams(), solver="scip")
 ```
 
 ---
 
-## Rebuilding the dataset
+## 7. How savings are measured
 
-`data/april_2026_hourly.csv` is generated from the two raw files:
+All policies are scored by `core_model/evaluation.py` with the optimizer's cost function (slack penalties excluded):
+
+- **No battery:** solar and grid only. Surplus PV is exported up to the export cap, then curtailed.
+- **Rule-based:** what a site typically runs without an optimizer. Per day it charges in the 6 cheapest hours
+  (without pushing import above the existing peak), discharges to cover load in the 6 most expensive hours,
+  and always stores surplus solar.
+- **Optimized:** the MILP schedule.
+
+**Stored-energy adjustment:** a policy that ends the horizon with less energy than it started with has used
+"free" stored energy. The change in SoC is valued at the horizon's average import price × discharge efficiency
+and added to the cost, so policies are compared like-for-like.
+
+---
+
+## 8. Verification and tests
+
+```bash
+pytest                      # ~10 s
+ruff check . && ruff format --check .
+```
+
+| Test file | What it checks |
+|---|---|
+| `test_formulation.py` | power balance, SoC dynamics and bounds, no simultaneous charge/discharge, power limits, zero slack when strict |
+| `test_solver_agreement.py` | HiGHS, SCIP and the SciPy reference reach the **same optimal cost** (normal, week-long, infeasible scenarios) |
+| `test_recovery.py` | infeasible scenario → elastic recovery with located violations |
+| `test_evaluation.py` | baselines obey physics, the rule never raises the peak, the optimizer beats both, cost breakdown = solver objective |
+| `test_data_validation.py` | missing columns, gaps, duplicates, NaN, negatives (all reported at once) |
+| `test_exception_translator.py` | supported phrasings plus known gaps as strict `xfail` |
+| `test_api.py`, `test_cli.py` | end-to-end through FastAPI and the CLI |
+
+**Why the cross-solver test matters:** when the JijModeling model was introduced, it disagreed with the original
+hand-built SciPy model. Checking each solution against the physics showed that the SciPy power balance had
+the **charge and discharge signs swapped**: the battery appeared to supply power while charging. Earlier results
+from that model were wrong. Both implementations now agree on every scenario, and CI keeps it that way.
+
+CI (`.github/workflows/ci.yml`) runs lint, then tests on Python 3.12/3.13/3.14 plus a CLI smoke test, then builds the
+Docker image and calls `/optimize` against the running container.
+
+### Solve time (Apple Silicon laptop)
+
+| Horizon | Binaries | HiGHS (OMMX) | SCIP (OMMX) | SciPy reference |
+|---|---|---|---|---|
+| 24 h | 24 | 0.26 s | 0.31 s | 0.02 s |
+| 168 h | 168 | 0.49 s | 0.35 s | 0.19 s |
+| 720 h | 720 | 1.43 s | 0.82 s | 0.76 s |
+
+JijModeling compile time is a constant ~0.25 s, so it is noticeable only at short horizons. For month-long
+runs SCIP is about 1.7× faster than HiGHS on this model.
+
+---
+
+## 9. Rebuilding the dataset
 
 ```bash
 python data/prepare_japan_grid_data.py
 python data/prepare_japan_grid_data.py --start-date 2026-04-01 --days 7 --out-csv data/week1.csv
-python data/prepare_japan_grid_data.py --wheeling-fee 9.0
 ```
 
-How the site data is derived:
+- **Load:** TEPCO area demand, hourly, scaled so the month's peak = 1,000 kW.
+- **Solar:** TEPCO area PV output, scaled so the month's peak = 600 kW.
+- **Import price:** JEPX Tokyo area price (30-min slots → hourly) + wheeling fee (default ¥8.5/kWh).
+- **Export price:** `min(0.7 × Tokyo price, ¥10/kWh)`.
 
-- **Load**: TEPCO area demand, averaged to hourly and scaled so the month's peak = 1,000 kW.
-- **Solar**: TEPCO area solar output, scaled so the month's peak = 600 kW.
-- **Import price**: JEPX Tokyo area price (30-min slots averaged to hourly) + wheeling fee (default ¥8.5/kWh).
-- **Export price**: `min(0.7 × Tokyo price, ¥10/kWh)`.
-
-To use another month, download the TEPCO `eria_jukyu_*.csv` and JEPX
-`spot_summary_*.csv` and point `--area-csv` / `--jepx-csv` at them. To use your own
-site data, provide a CSV with the columns `timestamp, load_kw, solar_kw,
-import_price_yen_kwh, export_price_yen_kwh` and pass it with `main.py --data`.
+To use your own site, pass a CSV with `timestamp, load_kw, solar_kw, import_price_yen_kwh, export_price_yen_kwh`
+via `--data`, or send rows as `series` to the API.
 
 ---
 
-## Model verification (Claude Code skill)
+## 10. Known limitations / next steps
 
-`ai_harness/.claude/skills/bess-model-verifier/SKILL.md` defines a checklist used
-when changing the model: power balance residual < 1e-5, SoC trajectory
-consistency, no simultaneous charge/discharge, slack diagnostics for infeasible
-cases, and solve-time benchmarks at T = 24 / 168 / 720.
-
----
-
-## Known limitations
-
-- **Solve time grows with horizon length** because there is one binary per hour.
-  Roughly 0.1s for 24h and 2s for 168h. A full month (720h) can take much longer.
-- **Perfect foresight.** Load, solar and prices are taken as known for the whole
-  horizon. There is no forecasting or rolling re-optimization.
-- **The alert translator only matches simple patterns** (see *Writing alerts*).
-  The `llm_callable` hook in `translate_exception_text` is a placeholder and is
-  not wired up yet.
-- **The recovery summary label says "vs strict"** but prints the absolute
-  recovery cost, because a strict solve that failed has no cost to compare against.
-- **The demand charge is applied once** to the horizon's peak import. For
-  horizons that are not a full billing month, compare costs with care.
-- **JijModeling is not used for solving.** The problem is built with it when the
-  package is installed, but it is always solved with SciPy.
+- **Perfect foresight.** Load, solar and prices are known for the whole horizon. Next step: forecasts plus
+  rolling-horizon re-optimization.
+- **Demand charge.** It is applied to the peak within the horizon. Japanese 基本料金 is based on the highest
+  **30-minute** demand over 12 months, so the next step is 30-min resolution with the running peak carried
+  between solves.
+- **Alert translator.** It is rule-based, with known gaps (see the `xfail` tests). The `llm_callable` hook is not
+  wired up yet.
+- **Baselines with alerts.** The baselines don't model alert overrides, so the comparison is skipped when an
+  alert is applied.
