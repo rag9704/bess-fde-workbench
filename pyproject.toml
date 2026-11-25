@@ -1,0 +1,26 @@
+[project]
+name = "bess-fde-workbench"
+version = "0.2.0"
+description = "Cost-optimal BESS + PV dispatch for Japanese commercial sites (JijModeling + OMMX)"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-ra"
+filterwarnings = [
+    # starlette deprecates httpx for its TestClient; harmless for our tests
+    "ignore:Using `httpx` with `starlette.testclient` is deprecated",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+extend-exclude = [".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E501"]  # line length is handled by `ruff format`
+
+[tool.ruff.lint.isort]
+force-sort-within-sections = true
