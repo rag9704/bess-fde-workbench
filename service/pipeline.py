@@ -92,6 +92,8 @@ def run_scenario(
     solver_options: SolverOptions | None = None,
     explain: bool = False,
     llm_client=None,
+    llm_provider: str | None = None,
+    llm_model: str | None = None,
 ) -> ScenarioResult:
     warnings = validate_timeseries(window, expected_step_hours=params.dt_hours)
     T = len(window)
@@ -108,6 +110,8 @@ def run_scenario(
             horizon_start=timestamps[0],
             mode=translator,
             client=llm_client,
+            provider=llm_provider,
+            model=llm_model,
         )
         if patch.end_soc_min_kwh is not None:
             # Overrides may only tighten limits, never loosen them.
@@ -146,6 +150,8 @@ def run_scenario(
             violations=recovery.infeasibility_summary(timestamps),
             params=params,
             client=llm_client,
+            provider=llm_provider,
+            model=llm_model,
         )
 
     final = result.final

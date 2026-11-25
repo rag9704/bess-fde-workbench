@@ -79,9 +79,10 @@ class OptimizeRequest(BaseModel):
     compare: bool = True
     include_schedule: bool = True
     translator: Literal["rules", "llm", "auto"] = Field(
-        "rules", description="How to read `alert`: rules (offline), llm (Claude), auto (Claude, fallback to rules)"
+        "rules",
+        description="How to read `alert`: rules (offline), llm (LLM backend set by server env), auto (LLM, fallback to rules)",
     )
-    explain: bool = Field(False, description="If limits conflict, add a Claude-written operator explanation")
+    explain: bool = Field(False, description="If limits conflict, add an LLM-written operator explanation")
     mip_rel_gap: float | None = Field(None, ge=0, le=1, description="Accept a schedule within this relative gap")
     time_limit_sec: float | None = Field(None, gt=0, le=300, description="Solver time limit")
     lp_first: bool = Field(False, description="Exact speed-up: use the LP relaxation when it is MILP-feasible")

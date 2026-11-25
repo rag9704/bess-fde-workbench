@@ -13,16 +13,26 @@ Design (the "AI harness" contract):
 """
 
 from dataclasses import dataclass
+import json
 import logging
+import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from .exception_translator import ScheduleOverridePatch, translate_exception_text
+from .llm_provider import (
+    DEFAULT_ANTHROPIC_MODEL,
+    LLMConfig,
+    LLMUnavailable,
+    openai_client,
+    resolve_llm_config,
+    status_error_message,
+)
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "claude-opus-5-5"
+DEFAULT_MODEL = DEFAULT_ANTHROPIC_MODEL  # used when the Anthropic backend is picked and no model is set
 STORM_RESERVE_FRAC = 0.75  # site policy, applied by code
 
 
@@ -91,7 +101,7 @@ def _clamp_window(start: int, end: int, horizon: int) -> tuple[int, int] | None:
 
 
 def extraction_to_patch(ex: AlertExtraction, capacity_kwh: float, horizon_hours: int) -> ScheduleOverridePatch:
-    """Deterministic, bounded conversion from Claude's extraction to model overrides."""
+    """Deterministic, bounded conversion from the LLM's extraction to model overrides."""
     patch = ScheduleOverridePatch()
 
     for r in ex.reserves:
@@ -137,11 +147,9 @@ def extraction_to_patch(ex: AlertExtraction, capacity_kwh: float, horizon_hours:
     return patch
 
 
-# --------------------------------------------------------------------------- Claude call
+# --------------------------------------------------------------------------- LLM calls
 
-
-class LLMUnavailable(Exception):
-    """Claude could not produce a usable extraction (no credentials, API error, refusal, ...)."""
+__all__ = ["LLMUnavailable", "LLMConfig", "translate_alert", "extract_alert", "extraction_to_patch"]
 
 
 @dataclass
@@ -150,30 +158,40 @@ class LLMUsage:
     output_tokens: int = 0
 
 
-def extract_with_claude(
+def _user_message(text: str, capacity_kwh: float, horizon_hours: int, horizon_start: str | None) -> str:
+    return (
+        f"Horizon: {horizon_hours} hourly steps starting {horizon_start or '00:00 (hour index = clock hour)'}.\n"
+        f"Battery capacity: {capacity_kwh:.0f} kWh.\n\n"
+        f"Operator alert:\n<alert>\n{text}\n</alert>"
+    )
+
+
+def extract_alert(
     text: str,
     capacity_kwh: float,
     horizon_hours: int,
     horizon_start: str | None = None,
     client: Any | None = None,
-    model: str = DEFAULT_MODEL,
+    config: LLMConfig | None = None,
 ) -> tuple[AlertExtraction, LLMUsage]:
-    """Ask Claude for a structured extraction of the alert. Raises LLMUnavailable on any failure."""
+    """Ask the configured LLM for a structured extraction. Raises LLMUnavailable on any failure."""
+    cfg = config or resolve_llm_config()
+    user = _user_message(text, capacity_kwh, horizon_hours, horizon_start)
+    if cfg.provider == "openai":
+        return _extract_openai(user, cfg, client)
+    return _extract_anthropic(user, cfg, client)
+
+
+def _extract_anthropic(user: str, cfg: LLMConfig, client: Any | None) -> tuple[AlertExtraction, LLMUsage]:
     import anthropic
 
     try:
         client = client or anthropic.Anthropic()
     except anthropic.AnthropicError as exc:  # e.g. no credentials configured
         raise LLMUnavailable(str(exc)) from exc
-
-    user = (
-        f"Horizon: {horizon_hours} hourly steps starting {horizon_start or '00:00 (hour index = clock hour)'}.\n"
-        f"Battery capacity: {capacity_kwh:.0f} kWh.\n\n"
-        f"Operator alert:\n<alert>\n{text}\n</alert>"
-    )
     try:
         response = client.beta.messages.parse(
-            model=model,
+            model=cfg.model,
             max_tokens=8000,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user}],
@@ -188,7 +206,7 @@ def extract_with_claude(
     except anthropic.RateLimitError as exc:
         raise LLMUnavailable("rate limited") from exc
     except anthropic.APIStatusError as exc:
-        raise LLMUnavailable(f"API error {exc.status_code}: {exc.message}") from exc
+        raise LLMUnavailable(status_error_message(exc, cfg)) from exc
     except anthropic.AnthropicError as exc:
         raise LLMUnavailable(str(exc)) from exc
     except TypeError as exc:
@@ -196,18 +214,93 @@ def extract_with_claude(
         # Any other TypeError is a programming error and must not be hidden.
         if "authentication" not in str(exc).lower():
             raise
-        raise LLMUnavailable("no Anthropic credentials configured") from exc
+        raise LLMUnavailable("no Anthropic credentials configured (set ANTHROPIC_API_KEY)") from exc
 
     if response.stop_reason == "refusal":
         raise LLMUnavailable("model declined the request")
     if response.stop_reason == "max_tokens" or response.parsed_output is None:
         raise LLMUnavailable(f"no usable structured output (stop_reason={response.stop_reason})")
-
     usage = LLMUsage(
         input_tokens=getattr(response.usage, "input_tokens", 0) or 0,
         output_tokens=getattr(response.usage, "output_tokens", 0) or 0,
     )
     return response.parsed_output, usage
+
+
+def _inline_refs(schema: dict) -> dict:
+    """Pydantic emits $defs/$ref; some OpenAI-compatible servers only accept a self-contained schema."""
+    defs = schema.get("$defs", {})
+
+    def walk(node):
+        if isinstance(node, dict):
+            if "$ref" in node:
+                return walk(defs[node["$ref"].split("/")[-1]])
+            return {k: walk(v) for k, v in node.items() if k != "$defs"}
+        if isinstance(node, list):
+            return [walk(v) for v in node]
+        return node
+
+    return walk(schema)
+
+
+ALERT_SCHEMA = _inline_refs(AlertExtraction.model_json_schema())
+_FENCE = re.compile(r"^```(?:json)?\s*|\s*```$")
+
+
+def _extract_openai(user: str, cfg: LLMConfig, client: Any | None) -> tuple[AlertExtraction, LLMUsage]:
+    import openai
+
+    client = client or openai_client(cfg)
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user}]
+    json_schema = {"type": "json_schema", "json_schema": {"name": "alert_extraction", "schema": ALERT_SCHEMA}}
+    try:
+        try:
+            response = client.chat.completions.create(model=cfg.model, messages=messages, response_format=json_schema)
+        except openai.BadRequestError as exc:
+            if "response_format" not in str(exc) and "json_schema" not in str(exc):
+                raise
+            # Endpoint without JSON-schema support: ask for plain JSON and put the schema in the prompt.
+            logger.info("endpoint rejected json_schema; retrying with json_object", extra={"model": cfg.model})
+            messages[0] = {
+                "role": "system",
+                "content": SYSTEM_PROMPT
+                + "\n\nReply with one JSON object matching this JSON Schema:\n"
+                + json.dumps(ALERT_SCHEMA),
+            }
+            response = client.chat.completions.create(
+                model=cfg.model, messages=messages, response_format={"type": "json_object"}
+            )
+    except openai.APIConnectionError as exc:
+        raise LLMUnavailable(f"connection error: {exc}") from exc
+    except openai.RateLimitError as exc:
+        raise LLMUnavailable("rate limited") from exc
+    except openai.APIStatusError as exc:
+        raise LLMUnavailable(status_error_message(exc, cfg)) from exc
+    except openai.OpenAIError as exc:
+        raise LLMUnavailable(str(exc)) from exc
+
+    if not response.choices:
+        raise LLMUnavailable("empty response")
+    choice = response.choices[0]
+    if getattr(choice.message, "refusal", None):
+        raise LLMUnavailable("model declined the request")
+    if choice.finish_reason == "length":
+        raise LLMUnavailable("no usable structured output (finish_reason=length)")
+    content = _FENCE.sub("", (choice.message.content or "").strip())
+    try:
+        extraction = AlertExtraction.model_validate_json(content)
+    except ValidationError as exc:
+        raise LLMUnavailable(f"output does not match the schema: {exc.error_count()} error(s)") from exc
+    usage = LLMUsage(
+        input_tokens=getattr(response.usage, "prompt_tokens", 0) or 0,
+        output_tokens=getattr(response.usage, "completion_tokens", 0) or 0,
+    )
+    return extraction, usage
+
+
+def extract_with_claude(*args, **kwargs) -> tuple[AlertExtraction, LLMUsage]:
+    """Backward-compatible name for `extract_alert`."""
+    return extract_alert(*args, **kwargs)
 
 
 TranslatorMode = Literal["rules", "llm", "auto"]
@@ -220,18 +313,21 @@ def translate_alert(
     horizon_start: str | None = None,
     mode: TranslatorMode = "rules",
     client: Any | None = None,
-    model: str = DEFAULT_MODEL,
+    provider: str | None = None,
+    model: str | None = None,
 ) -> tuple[ScheduleOverridePatch, str]:
     """Translate an alert into overrides. Returns (patch, source) with source "llm" or "rules".
 
     mode="rules": deterministic regex parser only (free, offline).
-    mode="llm":   Claude only; raises LLMUnavailable if it cannot be used.
-    mode="auto":  Claude, falling back to the rule parser on any failure.
+    mode="llm":   LLM only; raises LLMUnavailable if it cannot be used.
+    mode="auto":  LLM, falling back to the rule parser on any failure.
+    provider/model override the environment (see ai_harness.llm_provider).
     """
     if mode == "rules":
         return translate_exception_text(text, capacity_kwh=capacity_kwh), "rules"
     try:
-        extraction, usage = extract_with_claude(text, capacity_kwh, horizon_hours, horizon_start, client, model)
+        cfg = resolve_llm_config(provider, model)
+        extraction, usage = extract_alert(text, capacity_kwh, horizon_hours, horizon_start, client, cfg)
     except LLMUnavailable as exc:
         if mode == "llm":
             raise
@@ -239,5 +335,5 @@ def translate_alert(
         patch = translate_exception_text(text, capacity_kwh=capacity_kwh)
         patch.notes.append(f"LLM translator unavailable ({exc}); used rule parser")
         return patch, "rules"
-    logger.info("alert extracted by LLM", extra={"model": model, **usage.__dict__})
+    logger.info("alert extracted by LLM", extra={"llm": cfg.label, **usage.__dict__})
     return extraction_to_patch(extraction, capacity_kwh, horizon_hours), "llm"

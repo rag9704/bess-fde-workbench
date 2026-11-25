@@ -1,4 +1,4 @@
-"""Claude-written explanation of an infeasible scenario, for the site operator.
+"""LLM-written explanation of an infeasible scenario, for the site operator.
 
 The solver's elastic recovery already says *which* limit breaks, *when*, and *by how much*.
 This turns that into a short, actionable note: why the limits conflict and which decision
@@ -10,9 +10,10 @@ from typing import Any
 
 from core_model.formulation import BessParams
 
+from .llm_provider import LLMUnavailable, openai_client, resolve_llm_config
+
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "claude-opus-5-5"
 
 SYSTEM_PROMPT = """\
 You are an energy-operations engineer explaining an optimizer result to the operator of a commercial
@@ -31,11 +32,10 @@ def explain_conflicts(
     violations: list[str],
     params: BessParams,
     client: Any | None = None,
-    model: str = DEFAULT_MODEL,
+    provider: str | None = None,
+    model: str | None = None,
 ) -> str | None:
-    """Return a short explanation, or None if Claude is unavailable (the brief still has the facts)."""
-    import anthropic
-
+    """Return a short explanation, or None if the LLM is unavailable (the brief still has the facts)."""
     shown = violations[:12]
     more = f"\n(... and {len(violations) - len(shown)} more)" if len(violations) > len(shown) else ""
     user = (
@@ -46,9 +46,22 @@ def explain_conflicts(
         "Violations in the least-bad schedule:\n" + "\n".join(f"- {v}" for v in shown) + more
     )
     try:
+        cfg = resolve_llm_config(provider, model)
+        if cfg.provider == "openai":
+            return _explain_openai(user, cfg, client)
+        return _explain_anthropic(user, cfg, client)
+    except LLMUnavailable as exc:
+        logger.warning("LLM explanation unavailable", extra={"reason": str(exc)})
+        return None
+
+
+def _explain_anthropic(user: str, cfg, client: Any | None) -> str | None:
+    import anthropic
+
+    try:
         client = client or anthropic.Anthropic()
         response = client.beta.messages.create(
-            model=model,
+            model=cfg.model,
             max_tokens=4000,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user}],
@@ -57,13 +70,27 @@ def explain_conflicts(
             fallbacks="default",
         )
     except (anthropic.AnthropicError, TypeError) as exc:
-        # TypeError: the SDK's "no credentials" error; anything else is re-raised below.
+        # TypeError: the SDK's "no credentials" error; anything else is re-raised.
         if isinstance(exc, TypeError) and "authentication" not in str(exc).lower():
             raise
-        logger.warning("LLM explanation unavailable", extra={"reason": str(exc)})
-        return None
-
+        raise LLMUnavailable(str(exc)) from exc
     if response.stop_reason == "refusal":
         return None
     text = "".join(b.text for b in response.content if b.type == "text").strip()
     return text or None
+
+
+def _explain_openai(user: str, cfg, client: Any | None) -> str | None:
+    import openai
+
+    client = client or openai_client(cfg)
+    try:
+        response = client.chat.completions.create(
+            model=cfg.model,
+            messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user}],
+        )
+    except openai.OpenAIError as exc:
+        raise LLMUnavailable(str(exc)) from exc
+    if not response.choices or getattr(response.choices[0].message, "refusal", None):
+        return None
+    return (response.choices[0].message.content or "").strip() or None

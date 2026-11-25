@@ -186,16 +186,40 @@ the comparison wouldn't be like-for-like.
 | Mode | What happens | Needs |
 |---|---|---|
 | `rules` (default) | regex/keyword parser. Free, offline, deterministic | nothing |
-| `llm` | Claude extracts the request into a typed schema; code applies the guardrails | `ANTHROPIC_API_KEY` |
-| `auto` | Claude, falling back to `rules` on any API error, refusal or missing key | optional key |
+| `llm` | an LLM extracts the request into a typed schema; code applies the guardrails | an API key (below) |
+| `auto` | the LLM, falling back to `rules` on any API error, refusal, bad output or missing key | optional key |
+
+**Which LLM** is picked from the API key you have (`ai_harness/llm_provider.py`):
+
+| Backend | Set | Model |
+|---|---|---|
+| Claude (Anthropic API) | `ANTHROPIC_API_KEY` | `claude-opus-5-5` unless `LLM_MODEL` is set |
+| Any OpenAI-compatible endpoint: OpenAI, Gemini, Azure, vLLM, Ollama, LiteLLM | `LLM_API_KEY` (or `OPENAI_API_KEY` / `GEMINI_API_KEY`), `LLM_BASE_URL` | `LLM_MODEL` (required) |
+
+With several keys set, `LLM_API_KEY` or `LLM_BASE_URL` selects the OpenAI-compatible backend; otherwise
+`ANTHROPIC_API_KEY` selects Claude. `LLM_PROVIDER` or `--llm-provider` always overrides the choice.
+`GEMINI_API_KEY` on its own implies Google's endpoint, so `LLM_BASE_URL` can be left out.
 
 ```bash
-export ANTHROPIC_API_KEY=...
+# Claude
+export ANTHROPIC_API_KEY=sk-ant-...
 python main.py --translator llm --alert "停電リスクあり。14時から18時まで予備率70%を確保"
+
+# Gemini (or any OpenAI-compatible endpoint)
+export LLM_API_KEY=...                                                     # or GEMINI_API_KEY
+export LLM_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai/
+export LLM_MODEL=gemini-2.5-flash
 python main.py --translator auto --explain --alert "Typhoon warning, cap grid import at 300 kW"
 ```
 
-`--explain` adds a short Claude-written note when limits conflict: why they conflict, and the decision the
+Do not point `ANTHROPIC_BASE_URL` at an OpenAI-compatible endpoint. The Anthropic SDK sends `/v1/messages`
+requests, which such endpoints answer with 404. The code detects this and says so.
+
+The OpenAI-compatible backend asks for a JSON-schema response (`response_format`), retries with plain JSON
+mode if the endpoint does not support schemas, and validates the reply with the same Pydantic model, so the
+guardrails are identical for both backends.
+
+`--explain` adds a short LLM-written note when limits conflict: why they conflict, and the decision the
 operator has to make.
 
 What the **rule parser** understands:
@@ -218,7 +242,8 @@ It scores 16/30 on the eval set (section 8). Two known gaps are tracked as `xfai
 | `--data` | `data/april_2026_hourly.csv` | hourly input CSV |
 | `--start` / `--hours` | first row / 24 | horizon |
 | `--alert` | – | operator alert text |
-| `--translator` / `--explain` | `rules` / off | how to read `--alert`; Claude explanation of conflicts |
+| `--translator` / `--explain` | `rules` / off | how to read `--alert`; LLM explanation of conflicts |
+| `--llm-provider` / `--llm-model` | from env keys | `anthropic` or `openai` (any OpenAI-compatible endpoint); model name |
 | `--solver` | `highs` | `highs`, `scip`, `scipy` |
 | `--lp-first` | off | exact speed-up: accept the LP relaxation when it is MILP-feasible |
 | `--mip-gap` / `--time-limit` | solver default / none | stop early (status `FEASIBLE` if the time limit hits) |
@@ -267,7 +292,7 @@ The response contains:
 - explanation: `brief`, `overrides`, `translator_source`, `violations`, `explanation`
 - `comparison`: the cost breakdown per policy
 
-With `translator: "llm"` and Claude unavailable, the API returns **503**. Use `auto` to fall back instead.
+The API server picks the LLM backend from its own environment, as above. With `translator: "llm"` and the LLM unavailable, the API returns **503**. Use `auto` to fall back instead.
 
 If the data fails the input checks, the API returns **422 with every issue found**, not just the first:
 
@@ -360,7 +385,8 @@ MW→kW, end-of-horizon requests, two windows in one alert, clamping, storm poli
 
 ```bash
 python -m ai_harness.evals.run_alert_eval --mode rules     # offline baseline
-python -m ai_harness.evals.run_alert_eval --mode llm --out ai_harness/evals/results_llm.json   # ~30 Claude calls
+python -m ai_harness.evals.run_alert_eval --mode llm --out ai_harness/evals/results_llm.json   # ~30 calls to the configured LLM
+python -m ai_harness.evals.run_alert_eval --mode llm --provider openai --model gemini-2.5-flash  # compare another model
 ```
 
 | Translator | Accuracy | Notes |
@@ -399,7 +425,7 @@ python benchmarks/run_benchmarks.py    # ~2 min → benchmarks/RESULTS.md
 | `test_recovery.py` | infeasible scenario → elastic recovery with located violations |
 | `test_evaluation.py` | baselines obey physics, the rule never raises the peak, the optimizer beats both, cost breakdown = solver objective |
 | `test_data_validation.py` | missing columns, gaps, duplicates, NaN, negatives (all reported at once) |
-| `test_exception_translator.py`, `test_llm_harness.py` | rule parser, Claude path with a fake client, eval set integrity |
+| `test_exception_translator.py`, `test_llm_harness.py`, `test_llm_providers.py` | rule parser, Claude and OpenAI-compatible paths with fake clients, backend selection, eval set integrity |
 | `test_api.py`, `test_cli.py` | end-to-end through FastAPI and the CLI |
 
 **Bugs the verification caught:**

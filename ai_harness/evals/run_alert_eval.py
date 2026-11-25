@@ -1,8 +1,12 @@
 """Score the alert translator against a labelled set of operator alerts (English + Japanese).
 
     python -m ai_harness.evals.run_alert_eval --mode rules          # free, offline
-    python -m ai_harness.evals.run_alert_eval --mode llm            # calls Claude (~30 requests)
+    python -m ai_harness.evals.run_alert_eval --mode llm            # ~30 requests to the configured LLM
     python -m ai_harness.evals.run_alert_eval --mode llm --out ai_harness/evals/results_llm.json
+    python -m ai_harness.evals.run_alert_eval --mode llm --provider openai --model gemini-2.5-flash
+
+The LLM backend is chosen from the environment (see ai_harness/llm_provider.py), so this
+compares whichever models you have keys for on the same labelled cases.
 
 A case passes only if *all* overrides match: the reserve floors, the import caps and the
 end-of-horizon SoC (values within 1 kWh / 1 kW). Every case is a 24 h horizon starting 00:00
@@ -18,12 +22,13 @@ import sys
 import time
 
 from ai_harness.exception_translator import ScheduleOverridePatch, translate_exception_text
-from ai_harness.llm_translator import DEFAULT_MODEL, LLMUnavailable, extract_with_claude, extraction_to_patch
+from ai_harness.llm_provider import PROVIDERS, LLMConfig, LLMUnavailable, resolve_llm_config
+from ai_harness.llm_translator import extract_alert, extraction_to_patch
 
 CASES = Path(__file__).with_name("alert_cases.jsonl")
 CAPACITY_KWH = 2000.0
 HORIZON = 24
-# Claude Opus 5.5 list prices, USD per million tokens (input, output)
+# List prices, USD per million tokens (input, output). Unknown models report tokens only.
 PRICE_PER_MTOK = {"claude-opus-5-5": (4.0, 20.0)}
 
 
@@ -41,6 +46,7 @@ class CaseResult:
 @dataclass
 class EvalReport:
     mode: str
+    llm: str | None = None  # provider:model @ endpoint, for LLM runs
     results: list[CaseResult] = field(default_factory=list)
     input_tokens: int = 0
     output_tokens: int = 0
@@ -81,8 +87,10 @@ def score(got: dict, expected: dict) -> dict[str, bool]:
     }
 
 
-def run(mode: str, cases: list[dict], model: str = DEFAULT_MODEL, client=None) -> EvalReport:
-    report = EvalReport(mode=mode)
+def run(mode: str, cases: list[dict], config: LLMConfig | None = None, client=None) -> EvalReport:
+    if mode == "llm" and config is None:
+        config = resolve_llm_config()
+    report = EvalReport(mode=mode, llm=config.label if mode == "llm" else None)
     t0 = time.perf_counter()
     for case in cases:
         error = None
@@ -90,8 +98,8 @@ def run(mode: str, cases: list[dict], model: str = DEFAULT_MODEL, client=None) -
             if mode == "rules":
                 patch = translate_exception_text(case["text"], capacity_kwh=CAPACITY_KWH)
             else:
-                extraction, usage = extract_with_claude(
-                    case["text"], CAPACITY_KWH, HORIZON, "2026-04-01 00:00", client=client, model=model
+                extraction, usage = extract_alert(
+                    case["text"], CAPACITY_KWH, HORIZON, "2026-04-01 00:00", client=client, config=config
                 )
                 report.input_tokens += usage.input_tokens
                 report.output_tokens += usage.output_tokens
@@ -117,10 +125,11 @@ def run(mode: str, cases: list[dict], model: str = DEFAULT_MODEL, client=None) -
     return report
 
 
-def format_report(report: EvalReport, model: str = DEFAULT_MODEL) -> str:
+def format_report(report: EvalReport, model: str | None = None) -> str:
     n = len(report.results)
     lines = [
-        f"Mode: {report.mode}   cases: {n}   passed: {sum(r.passed for r in report.results)}   "
+        (f"LLM: {report.llm}\n" if report.llm else "")
+        + f"Mode: {report.mode}   cases: {n}   passed: {sum(r.passed for r in report.results)}   "
         f"accuracy: {report.accuracy:.0%}   time: {report.seconds:.1f}s"
     ]
     field_ok = Counter()
@@ -130,9 +139,13 @@ def format_report(report: EvalReport, model: str = DEFAULT_MODEL) -> str:
         "Per field: " + ", ".join(f"{k} {field_ok[k]}/{n}" for k in ("soc_min", "grid_cap", "end_soc_min_kwh"))
     )
     if report.mode == "llm":
-        pin, pout = PRICE_PER_MTOK.get(model, (0.0, 0.0))
-        cost = report.input_tokens / 1e6 * pin + report.output_tokens / 1e6 * pout
-        lines.append(f"Tokens: {report.input_tokens:,} in / {report.output_tokens:,} out   est. cost: ${cost:.3f}")
+        price = PRICE_PER_MTOK.get(model or "")
+        cost = (
+            f"est. cost: ${report.input_tokens / 1e6 * price[0] + report.output_tokens / 1e6 * price[1]:.3f}"
+            if price
+            else "est. cost: n/a (no price table for this model)"
+        )
+        lines.append(f"Tokens: {report.input_tokens:,} in / {report.output_tokens:,} out   {cost}")
     failed = [r for r in report.results if not r.passed]
     if failed:
         lines.append("\nFailures:")
@@ -149,21 +162,28 @@ def format_report(report: EvalReport, model: str = DEFAULT_MODEL) -> str:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--mode", choices=("rules", "llm"), default="rules")
-    ap.add_argument("--model", default=DEFAULT_MODEL)
+    ap.add_argument("--provider", choices=PROVIDERS, default=None, help="LLM backend (default: from env keys)")
+    ap.add_argument("--model", default=None, help="Model name (default: LLM_MODEL env, or claude-opus-5-5)")
     ap.add_argument("--cases", type=Path, default=CASES)
     ap.add_argument("--out", type=Path, default=None, help="Write per-case results as JSON")
     args = ap.parse_args(argv)
 
     try:
-        report = run(args.mode, load_cases(args.cases), model=args.model)
+        config = resolve_llm_config(args.provider, args.model) if args.mode == "llm" else None
+        report = run(args.mode, load_cases(args.cases), config=config)
     except LLMUnavailable as exc:
         print(f"Cannot run the LLM eval: {exc}", file=sys.stderr)
         return 3
-    print(format_report(report, args.model))
+    print(format_report(report, config.model if config else None))
     if args.out:
         args.out.write_text(
             json.dumps(
-                {"mode": report.mode, "accuracy": report.accuracy, "results": [r.__dict__ for r in report.results]},
+                {
+                    "mode": report.mode,
+                    "llm": report.llm,
+                    "accuracy": report.accuracy,
+                    "results": [r.__dict__ for r in report.results],
+                },
                 ensure_ascii=False,
                 indent=2,
             ),

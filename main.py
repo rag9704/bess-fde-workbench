@@ -12,6 +12,7 @@ from dataclasses import replace
 from pathlib import Path
 import sys
 
+from ai_harness.llm_provider import PROVIDERS
 from ai_harness.llm_translator import LLMUnavailable
 from core_model.data_validation import DataValidationError
 from core_model.evaluation import format_comparison
@@ -42,11 +43,18 @@ def parse_args() -> argparse.Namespace:
         "--translator",
         choices=("rules", "llm", "auto"),
         default="rules",
-        help="How to read --alert: rules (offline regex), llm (Claude), auto (Claude, falling back to rules)",
+        help="How to read --alert: rules (offline regex), llm (LLM), auto (LLM, falling back to rules)",
     )
     p.add_argument(
-        "--explain", action="store_true", help="If limits conflict, ask Claude for a short operator explanation"
+        "--explain", action="store_true", help="If limits conflict, ask the LLM for a short operator explanation"
     )
+    p.add_argument(
+        "--llm-provider",
+        choices=PROVIDERS,
+        default=None,
+        help="LLM backend (default: picked from the API key in the environment; see ai_harness/llm_provider.py)",
+    )
+    p.add_argument("--llm-model", default=None, help="LLM model name (default: LLM_MODEL env, or claude-opus-5-5)")
     p.add_argument(
         "--solver", choices=SOLVERS, default="highs", help="Solver backend (default: highs via JijModeling + OMMX)"
     )
@@ -124,6 +132,8 @@ def main() -> int:
                 mip_rel_gap=args.mip_gap, time_limit_sec=args.time_limit, lp_first=args.lp_first
             ),
             explain=args.explain,
+            llm_provider=args.llm_provider,
+            llm_model=args.llm_model,
         )
     except DataValidationError as exc:
         print(str(exc), file=sys.stderr)
@@ -141,7 +151,7 @@ def main() -> int:
 
     print("\n" + result.brief)
     if result.explanation:
-        print("\nExplanation (Claude):\n" + result.explanation)
+        print("\nExplanation (LLM):\n" + result.explanation)
 
     if result.comparison is not None:
         print("\nValue vs baselines:")
