@@ -8,7 +8,9 @@ import importlib.util
 import numpy as np
 import pytest
 
-from core_model.solver_runner import solve_dispatch
+from core_model.solver_runner import SolverOptions, solve_dispatch
+
+EXACT = SolverOptions(mip_rel_gap=1e-9)  # prove optimality; default gaps allow near-optimal stops
 
 SCIP_AVAILABLE = importlib.util.find_spec("ommx_pyscipopt_adapter") is not None
 
@@ -24,8 +26,8 @@ def test_backends_agree(solver, scenario, request, params, typhoon_overrides):
     else:
         window, kw = request.getfixturevalue(scenario), {}
 
-    ref_s, ref_r = solve_dispatch(window, params, solver="highs", **kw)
-    oth_s, oth_r = solve_dispatch(window, params, solver=solver, **kw)
+    ref_s, ref_r = solve_dispatch(window, params, solver="highs", options=EXACT, **kw)
+    oth_s, oth_r = solve_dispatch(window, params, solver=solver, options=EXACT, **kw)
 
     assert ref_s.status == oth_s.status
     ref, oth = (ref_r or ref_s), (oth_r or oth_s)
