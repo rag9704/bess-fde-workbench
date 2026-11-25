@@ -5,8 +5,8 @@ import numpy as np
 import pandas as pd
 
 
-def load_jepx_hourly(jepx_csv: Path) -> pd.DataFrame:
-    """Parse JEPX spot_summary_YYYY.csv (30-min slots 1..48) into hourly Tokyo area prices."""
+def load_jepx_hourly(jepx_csv: Path, freq: str = "1h") -> pd.DataFrame:
+    """Parse JEPX spot_summary_YYYY.csv (30-min slots 1..48) into Tokyo area prices at `freq` ("1h" or "30min")."""
     df = pd.read_csv(jepx_csv, encoding="cp932")
     df = df.rename(
         columns={
@@ -15,8 +15,8 @@ def load_jepx_hourly(jepx_csv: Path) -> pd.DataFrame:
             "エリアプライス東京(円/kWh)": "tokyo_price_yen_kwh",
         }
     )
-    df["hour"] = (df["slot"].astype(int) - 1) // 2
-    df["timestamp"] = pd.to_datetime(df["date"]) + pd.to_timedelta(df["hour"], unit="h")
+    slot_start = pd.to_datetime(df["date"]) + pd.to_timedelta((df["slot"].astype(int) - 1) * 30, unit="min")
+    df["timestamp"] = slot_start.dt.floor(freq)
 
     return df.groupby("timestamp", as_index=False)["tokyo_price_yen_kwh"].mean().round(3)
 
@@ -25,6 +25,7 @@ def load_tepco_area_hourly(
     area_csv: Path,
     site_peak_load_kw: float = 1000.0,
     site_solar_cap_kw: float = 600.0,
+    freq: str = "1h",
 ) -> pd.DataFrame:
     """Parse TEPCO eria_jukyu CSV (utf-8-sig, MW) and scale normalized curves to a BTM site."""
     df = pd.read_csv(area_csv, encoding="utf-8-sig", skiprows=1)
@@ -33,7 +34,7 @@ def load_tepco_area_hourly(
     df["demand_mw"] = pd.to_numeric(df["エリア需要"], errors="coerce")
     df["solar_mw"] = pd.to_numeric(df["太陽光発電実績"], errors="coerce").fillna(0.0)
 
-    hourly = df.set_index("timestamp")[["demand_mw", "solar_mw"]].resample("1h").mean().dropna().reset_index()
+    hourly = df.set_index("timestamp")[["demand_mw", "solar_mw"]].resample(freq).mean().dropna().reset_index()
 
     hourly["load_kw"] = (hourly["demand_mw"] / hourly["demand_mw"].max() * site_peak_load_kw).round(1)
     hourly["solar_kw"] = (hourly["solar_mw"] / max(hourly["solar_mw"].max(), 1e-6) * site_solar_cap_kw).round(1)
@@ -48,9 +49,10 @@ def build_dataset(
     wheeling_fee_yen_kwh: float = 8.5,
     start_date: str | None = None,
     days: int | None = None,
+    freq: str = "1h",
 ) -> pd.DataFrame:
-    tepco = load_tepco_area_hourly(area_csv)
-    jepx = load_jepx_hourly(jepx_csv)
+    tepco = load_tepco_area_hourly(area_csv, freq=freq)
+    jepx = load_jepx_hourly(jepx_csv, freq=freq)
 
     merged = pd.merge(tepco, jepx, on="timestamp", how="inner").sort_values("timestamp")
 
@@ -89,6 +91,7 @@ def main() -> None:
     parser.add_argument("--wheeling-fee", type=float, default=8.5)
     parser.add_argument("--start-date", type=str, default=None, help="Optional YYYY-MM-DD")
     parser.add_argument("--days", type=int, default=None, help="Optional number of days (e.g. 7 for a week)")
+    parser.add_argument("--freq", choices=("1h", "30min"), default="1h", help="Time step (raw data is 30-min)")
     args = parser.parse_args()
 
     build_dataset(
@@ -98,6 +101,7 @@ def main() -> None:
         wheeling_fee_yen_kwh=args.wheeling_fee,
         start_date=args.start_date,
         days=args.days,
+        freq=args.freq,
     )
 
 

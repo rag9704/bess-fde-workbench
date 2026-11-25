@@ -1,0 +1,5 @@
+scenario,milp_cost_yen,lp_cost_yen,integrality_gap_pct,lp_simultaneous_steps,milp_time_sec,lp_time_sec,lp_first_time_sec,lp_first_outcome
+"Tokyo Apr 2026, 1 h",15028232,15028232,0.0,0,1.068,0.431,0.434,LP accepted
+"Tokyo Apr 2026, 30 min",14929991,14929991,0.0,0,1.607,0.681,0.683,LP accepted
+"negative midday prices, 1 h",12063242,12063242,0.0,0,0.639,0.425,0.426,LP accepted
+"negative prices, zero wear cost, 1 h",11796186,11796055,0.0011,9,0.608,0.421,1.032,fell back to MILP
