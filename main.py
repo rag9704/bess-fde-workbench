@@ -4,32 +4,51 @@ Examples:
     python main.py                                   # first 24h of the dataset
     python main.py --start 2026-04-07 --hours 168    # one week from Apr 7
     python main.py --alert "Typhoon warning, cap grid import at 300 kW"
-    python main.py --capacity-kwh 3000 --max-charge-kw 750 --out schedule.csv
+    python main.py --solver scip --capacity-kwh 3000 --out output/schedule.csv
 """
 
 import argparse
 from dataclasses import replace
 from pathlib import Path
+import sys
 
-import numpy as np
-import pandas as pd
-
-from ai_harness.diagnostic_agent import build_operator_brief
-from ai_harness.exception_translator import translate_exception_text
+from core_model.data_validation import DataValidationError
+from core_model.evaluation import format_comparison
 from core_model.formulation import BessParams
-from core_model.solver_runner import DispatchResult, solve_dispatch
-
-DEFAULT_DATA = Path(__file__).parent / "data" / "april_2026_hourly.csv"
+from core_model.logging_utils import setup_logging
+from core_model.solver_runner import SOLVERS
+from service.pipeline import DEFAULT_DATA, load_data, run_scenario, select_window
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Optimize hourly battery dispatch for a solar + BESS site.")
-    p.add_argument("--data", type=Path, default=DEFAULT_DATA, help="Hourly site CSV (see data/prepare_japan_grid_data.py)")
-    p.add_argument("--start", type=str, default=None, help="Start timestamp, e.g. 2026-04-07 or '2026-04-07 06:00'. Default: first row")
-    p.add_argument("--hours", type=int, default=24, help="Horizon length in hours (default 24; 168 = week, 720 = month)")
-    p.add_argument("--alert", type=str, default=None, help="Operator alert text to translate into reserve / grid-cap overrides")
-    p.add_argument("--no-recovery", action="store_true", help="Do not run the elastic (slack) re-solve when strict is infeasible")
+    p.add_argument(
+        "--data", type=Path, default=DEFAULT_DATA, help="Hourly site CSV (see data/prepare_japan_grid_data.py)"
+    )
+    p.add_argument(
+        "--start",
+        type=str,
+        default=None,
+        help="Start timestamp, e.g. 2026-04-07 or '2026-04-07 06:00'. Default: first row",
+    )
+    p.add_argument(
+        "--hours", type=int, default=24, help="Horizon length in hours (default 24; 168 = week, 720 = month)"
+    )
+    p.add_argument(
+        "--alert", type=str, default=None, help="Operator alert text to translate into reserve / grid-cap overrides"
+    )
+    p.add_argument(
+        "--solver", choices=SOLVERS, default="highs", help="Solver backend (default: highs via JijModeling + OMMX)"
+    )
+    p.add_argument(
+        "--no-recovery", action="store_true", help="Do not run the elastic (slack) re-solve when strict is infeasible"
+    )
+    p.add_argument(
+        "--no-compare", action="store_true", help="Skip the comparison against no-battery / rule-based baselines"
+    )
     p.add_argument("--out", type=Path, default=None, help="Write the hourly schedule to this CSV")
+    p.add_argument("--log-level", default=None, help="DEBUG / INFO / WARNING (default: $LOG_LEVEL or WARNING)")
+    p.add_argument("--log-json", action="store_true", help="Emit JSON log lines (default: $LOG_FORMAT=json)")
 
     g = p.add_argument_group("battery / site parameters (defaults from BessParams)")
     d = BessParams()
@@ -45,39 +64,10 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def load_window(path: Path, start: str | None, hours: int) -> pd.DataFrame:
-    df = pd.read_csv(path, parse_dates=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
-    if start:
-        df = df[df["timestamp"] >= pd.to_datetime(start)]
-    window = df.iloc[:hours].reset_index(drop=True)
-    if window.empty:
-        raise SystemExit(f"No data in {path} for start={start!r}")
-    if len(window) < hours:
-        print(f"Warning: only {len(window)} hours available (requested {hours}).")
-    return window
-
-
-def schedule_frame(window: pd.DataFrame, res: DispatchResult) -> pd.DataFrame:
-    T = len(window)
-    return pd.DataFrame(
-        {
-            "timestamp": window["timestamp"],
-            "load_kw": window["load_kw"],
-            "solar_kw": window["solar_kw"],
-            "import_price_yen_kwh": window["import_price_yen_kwh"],
-            "grid_import_kw": np.round(res.p_imp_kw, 1),
-            "grid_export_kw": np.round(res.p_exp_kw, 1),
-            "charge_kw": np.round(res.p_ch_kw, 1),
-            "discharge_kw": np.round(res.p_dis_kw, 1),
-            "soc_end_kwh": np.round(res.soc_kwh[1 : T + 1], 1),
-            "slack_import_kw": np.round(res.slack_imp_kw, 1),
-            "slack_soc_kwh": np.round(res.slack_soc_kwh[1 : T + 1], 1),
-        }
-    )
-
-
-def main() -> None:
+def main() -> int:
     args = parse_args()
+    setup_logging(args.log_level, json_format=True if args.log_json else None)
+
     params = replace(
         BessParams(),
         capacity_kwh=args.capacity_kwh,
@@ -91,42 +81,55 @@ def main() -> None:
         degradation_cost_yen_kwh=args.degradation_yen_kwh,
     )
 
-    window = load_window(args.data, args.start, args.hours)
-    T = len(window)
-    timestamps = window["timestamp"].astype(str).tolist()
-    print(f"Horizon: {timestamps[0]} -> {timestamps[-1]} ({T} h) | Battery {params.capacity_kwh:.0f} kWh / "
-          f"{params.max_charge_kw:.0f} kW")
+    window = select_window(load_data(args.data), args.start, args.hours)
+    if window.empty:
+        print(f"No data in {args.data} for start={args.start!r}", file=sys.stderr)
+        return 2
+    if len(window) < args.hours:
+        print(f"Warning: only {len(window)} hours available (requested {args.hours}).")
 
-    soc_min = grid_cap = None
-    if args.alert:
-        patch = translate_exception_text(args.alert, capacity_kwh=params.capacity_kwh)
-        print("\nAlert overrides:")
-        for line in patch.diff_summary():
-            print(f"  - {line}")
-        if patch.end_soc_min_kwh is not None:
-            params = replace(params, end_soc_min_kwh=patch.end_soc_min_kwh)
-        soc_min_full, grid_cap = patch.apply(T, 0.10 * params.capacity_kwh, params.grid_import_cap_kw)
-        soc_min = soc_min_full[:T]
-
-    strict, recovery = solve_dispatch(
-        window,
-        params,
-        soc_min_kwh=soc_min,
-        grid_import_cap_kw=grid_cap,
-        auto_recover_infeasible=not args.no_recovery,
+    ts = window["timestamp"].astype(str)
+    print(
+        f"Horizon: {ts.iloc[0]} -> {ts.iloc[-1]} ({len(window)} h) | "
+        f"Battery {params.capacity_kwh:.0f} kWh / {params.max_charge_kw:.0f} kW | Solver: {args.solver}"
     )
 
-    print("\n" + build_operator_brief(strict, recovery, timestamps))
+    try:
+        result = run_scenario(
+            window,
+            params,
+            alert=args.alert,
+            solver=args.solver,
+            auto_recover=not args.no_recovery,
+            compare=not args.no_compare,
+        )
+    except DataValidationError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
 
-    final = strict if strict.status == "OPTIMAL" else recovery
+    for w in result.warnings:
+        print(f"Note: {w}")
+    if result.patch is not None:
+        print("\nAlert overrides:")
+        for line in result.patch.diff_summary():
+            print(f"  - {line}")
+
+    print("\n" + result.brief)
+
+    if result.comparison is not None:
+        print("\nValue vs baselines:")
+        print(format_comparison(result.comparison))
+
     if args.out:
-        if final is None or final.status != "OPTIMAL":
+        sched = result.schedule_frame()
+        if sched is None:
             print(f"\nNo feasible schedule to write to {args.out}.")
         else:
             args.out.parent.mkdir(parents=True, exist_ok=True)
-            schedule_frame(window, final).to_csv(args.out, index=False)
+            sched.to_csv(args.out, index=False)
             print(f"\nSchedule written to {args.out}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
