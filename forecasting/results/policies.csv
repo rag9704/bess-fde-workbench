@@ -1,0 +1,9 @@
+policy,cost_yen,saving_vs_no_battery_yen,share_of_hindsight_saving_pct,peak_import_kw,end_soc_kwh,replans,solve_sec,recovered,idle_fallbacks,guarded_hours
+No battery,11798656,0,0.0,637.0,1000,,,,,
+"Rule-based (charge cheap hours, discharge expensive)",11441032,357624,54.1,637.0,200,,,,,
+MPC + persistence,11314621,484035,73.2,588.1,200,744.0,126.2,0.0,0.0,87.0
+MPC + gradient boosting,11277924,520732,78.8,569.1,200,744.0,134.5,0.0,0.0,118.0
+MPC + perfect forecast,11182129,616526,93.3,489.9,200,744.0,130.0,0.0,0.0,0.0
+"MPC + gradient boosting, JEPX prices forecast too",11418431,380224,57.5,569.1,200,744.0,135.7,0.0,0.0,139.0
+"MPC + gradient boosting, no peak guard",11724330,74326,11.2,942.5,200,744.0,131.3,0.0,0.0,0.0
+"Hindsight optimum (one solve, actual data)",11137714,660941,100.0,474.0,800,1.0,0.7,,,
