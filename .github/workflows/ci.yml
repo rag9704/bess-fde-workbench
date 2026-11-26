@@ -38,6 +38,12 @@ jobs:
         run: python -m ai_harness.evals.run_alert_eval --mode rules
       - name: CLI smoke test
         run: python main.py --hours 24 --out output/schedule.csv
+      - name: Reusable components (battery site and factory from the same blocks)
+        run: |
+          python -m components sites/tokyo_office_bess.yaml --steps 24
+          python -m components sites/factory_inventory.yaml --steps 14
+      - name: Forecast + rolling re-planning smoke test
+        run: python -m forecasting.run_study --days 1 --solver scipy --no-write
 
   docker:
     runs-on: ubuntu-latest

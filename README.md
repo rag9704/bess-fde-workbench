@@ -13,7 +13,13 @@ TEPCO area demand/solar data and JEPX Tokyo spot prices.
   *which* limit breaks, *when*, and *by how much*, and Claude can explain the trade-off to the operator.
 - **Benchmarked:** scaling to 30-min resolution, a quality-vs-time study, and an exact **LP-first** strategy
   that returns the proven MILP optimum about 2.5× faster on real data.
-- **Production-ready:** CLI, FastAPI service, Docker image, input checks, structured logging, 70+ tests, a
+- **Reusable components:** the same six building blocks (`node`, `profile`, `market`, `storage`, `producer`,
+  `peak_charge`) describe a battery site *and* a factory's production and inventory plan in YAML. The battery
+  site built from blocks gives exactly the hand-written model's optimum; lot sizing matches a Wagner–Whitin DP.
+- **Forecasts and rolling re-planning:** gradient-boosting forecasts of load, PV and JEPX price, hourly MPC with
+  the month's peak carried between solves, and a real-time peak guard. The study splits the gap to the
+  hindsight optimum into forecast error and rolling-horizon loss.
+- **Production-ready:** CLI, FastAPI service, Docker image, input checks, structured logging, 120+ tests, a
   model-verification report, Claude Code skills for the team, and GitHub Actions CI.
 
 **Results on April 2026 data** (2,000 kWh / 500 kW battery, 600 kW PV, 1,000 kW peak load):
@@ -88,12 +94,23 @@ bess-fde-workbench/
 │   └── api.py                     # FastAPI app: GET /health, POST /optimize
 ├── data/
 │   ├── prepare_japan_grid_data.py # raw TEPCO + JEPX → hourly site CSV
-│   ├── april_2026_hourly.csv      # ready-to-use dataset (720 h)
+│   ├── april_2026_hourly.csv      # April 2026 (720 h): default for the CLI, API, tests and README numbers
 │   ├── april_2026_30min.csv       # same month at 30-min resolution (1,440 steps; benchmarks)
-│   └── raw/                       # TEPCO eria_jukyu + JEPX spot_summary
+│   ├── japan_2026_hourly.csv      # 1 Apr – 25 Nov 2026 (5,736 h): forecasting and seasonal studies
+│   ├── make_factory_demand.py     # synthetic daily demand for the factory example
+│   └── raw/                       # TEPCO eria_jukyu (Apr–Nov 2026) + JEPX spot_summary (Jan–Nov 2026)
+├── components/                    # reusable building blocks → one JijModeling model per YAML site
+│   ├── core.py                    # ModelBuilder: nodes, flow balance, costs
+│   ├── library.py                 # node, profile, market, storage, producer, peak_charge
+│   └── site.py                    # YAML loading/validation, solve via OMMX (HiGHS / SCIP), per-component costs
+├── sites/                         # tokyo_office_bess.yaml, factory_inventory.yaml
+├── forecasting/
+│   ├── forecasters.py             # persistence, gradient boosting (validated per target), perfect
+│   ├── mpc.py                     # hourly rolling re-planning with peak carry-over and peak guard
+│   └── run_study.py               # → RESULTS.md: what uncertainty costs
 ├── benchmarks/                    # run_benchmarks.py → RESULTS.md (scaling, gap/time, LP relaxation)
 ├── verify.py                      # model verification report (physics, cross-solver, recovery, timing)
-├── .claude/skills/                # Claude Code skills: bess-model-verifier, alert-translator-eval
+├── .claude/skills/                # Claude Code skills: bess-model-verifier, alert-translator-eval, add-component
 ├── tests/                         # pytest suite
 ├── Dockerfile, .github/workflows/ci.yml, pyproject.toml, requirements*.txt
 ```
@@ -408,7 +425,124 @@ every fallback path, only-tighten behaviour, and a check that the eval labels ag
 
 ---
 
-## 9. Verification, tests and benchmarks
+## 9. Reusable components: one library, many sites
+
+Every new customer should be a **configuration**, not a new model. `components/` provides six building
+blocks; each one adds its own data, variables, flows, constraints and costs to one JijModeling problem,
+and every `node` gets a balance constraint (flows in = flows out, at every step).
+
+```bash
+python -m components sites/tokyo_office_bess.yaml --steps 24 --show battery.level grid.buy
+python -m components sites/factory_inventory.yaml --show line.output warehouse.level supplier.buy
+```
+
+```yaml
+# sites/tokyo_office_bess.yaml (excerpt)
+components:
+  - {type: node, name: bus}
+  - {type: profile, name: load, node: bus, direction: out, column: load_kw}
+  - {type: profile, name: pv, node: bus, direction: in, column: solar_kw}
+  - {type: market, name: grid, node: bus, buy_price: import_price_yen_kwh, sell_price: export_price_yen_kwh,
+     buy_limit: 1200, sell_max: 400}
+  - {type: storage, name: battery, node: bus, capacity: 2000, max_in: 500, max_out: 500, eff_in: 0.94,
+     eff_out: 0.94, initial: 1000, final_min: 800, floor: 200, throughput_cost: 2.0, exclusive_modes: true}
+  - {type: peak_charge, name: demand_charge, flow: grid.buy, rate: 1400}
+```
+
+**The same blocks, a different industry.** A battery's state of charge and a warehouse's inventory follow
+the same equation, `level[t+1] = level[t] + eff_in·in[t]·dt − out[t]·dt/eff_out`. A battery's
+charge/discharge mode lock and a production setup are the same binary pattern.
+
+| Block | Battery site | Factory (`sites/factory_inventory.yaml`, one step = one day) |
+|---|---|---|
+| `node` | site electrical bus | finished-goods stock point |
+| `profile` | load (out), PV (in) | customer demand, with a lost-sales penalty |
+| `market` | grid import/export at JEPX prices | contract supplier, 80 units/day |
+| `storage` | battery: SoC, efficiency, wear, reserve floor | warehouse: holding cost, safety stock |
+| `producer` | (a generator with a start cost) | production line: setup cost, minimum run, overtime pay on weekends and Golden Week |
+| `peak_charge` | demand charge on peak import | capacity fee on the peak supplier volume |
+
+In the factory plan the line runs in batches to save setups, and stock builds up before Golden Week.
+
+**How we know it is right**
+- **Same optimum as the original model.** The battery site built from blocks gives the hand-written
+  `core_model` model's optimum to 1e-8 for a day and a week, on HiGHS and SCIP, including a rolling state
+  (measured SoC plus the peak so far).
+- **Independent check.** Uncapacitated lot sizing built from the blocks matches an exact Wagner–Whitin
+  dynamic program on random instances.
+- **Factory physics.** Balance, inventory dynamics, setup logic and the cost breakdown are each tested.
+- **Config errors are specific.** A wrong type, an unknown field, a dangling node or flow reference, a missing
+  column or a duplicate name names the component and the field at fault.
+
+The `add-component` Claude Code skill (`.claude/skills/add-component`) explains how to add a block, and which
+tests it needs, without breaking these guarantees.
+
+## 10. Forecasts and rolling re-planning
+
+The optimizer above knows the future: load, PV and prices for the whole horizon. A real site doesn't.
+`forecasting/` simulates what it does instead, hour by hour, settled against **actual** data:
+
+1. **Forecast** the next 24 h from data strictly before now. The JEPX price is used wherever the day-ahead
+   auction has already published it (by 10:00 the day before); only the unknown hours are forecast.
+2. **Plan** with the same MILP, starting from the *measured* SoC and carrying the **month's peak import so
+   far** (`prior_peak_kw`). Raising the peak costs the demand charge; staying below it is free.
+3. **Apply the first hour only.** A real-time **peak guard** cuts charging, then adds discharge, if actual
+   import would exceed the planned peak. The grid absorbs the rest of the forecast error.
+4. Move on one hour and re-plan.
+
+```bash
+python -m forecasting.run_study                         # October 2026, 744 re-plans per policy, HiGHS (~17 min)
+python -m forecasting.run_study --solver scipy          # same in ~3 min
+python -m forecasting.run_study --test-start 2026-08-01 --days 7
+```
+
+**Forecasters** (`forecasting/forecasters.py`): *persistence* (same hour yesterday) and *gradient boosting*
+(scikit-learn `HistGradientBoostingRegressor`, the LightGBM algorithm). Gradient boosting uses lead, hour,
+day of week, Japanese holidays / Obon / New Year, the day-after-a-holiday flag, and lags of 24, 48 and 168 h.
+Each target's model predicts the **correction to persistence**, and is used only if it beats persistence on a
+held-out last two weeks of training. A forecaster cannot see the future by construction; a test changes all
+data after the forecast origin and checks the forecast does not move.
+
+**October 2026** (one billing month; trained on April–September site data and January–September JEPX prices;
+full table in [`forecasting/RESULTS.md`](forecasting/RESULTS.md)):
+
+| Policy | Cost | Saving vs no battery | Share of hindsight saving | Peak import |
+|---|---|---|---|---|
+| No battery | ¥11,798,656 | — | 0% | 637 kW |
+| Rule-based | ¥11,441,032 | ¥357,624 | 54% | 637 kW |
+| MPC + persistence | ¥11,314,621 | ¥484,035 | 73% | 588 kW |
+| **MPC + gradient boosting** | **¥11,277,924** | **¥520,732** | **79%** | 569 kW |
+| MPC + perfect forecast | ¥11,182,129 | ¥616,526 | 93% | 490 kW |
+| Hindsight optimum (one solve) | ¥11,137,714 | ¥660,941 | 100% | 474 kW |
+| *Ablation:* gradient boosting, JEPX prices forecast too | ¥11,418,431 | ¥380,224 | 57% | 569 kW |
+| *Ablation:* gradient boosting, no peak guard | ¥11,724,330 | ¥74,326 | 11% | 943 kW |
+
+What it shows:
+- **The real-time peak guard is worth more than any forecast.** Without it, forecast error creates new monthly
+  peaks (943 kW) and the battery saves almost nothing. A planner on its own is not a controller.
+- **Use the market's own information.** Using the published JEPX day-ahead prices instead of forecasting them
+  is worth ¥140,507 in the month; 92% of the price-hours in a 24 h plan are already published. In October gradient boosting forecasts the price *worse* than persistence
+  (prices rose sharply after the validation window), which is exactly when knowing the auction result matters.
+- **The remaining gap is split in two.** Forecast error costs ¥95,795 (gradient boosting vs perfect forecast);
+  the 24 h rolling horizon and its terminal reserve cost ¥44,415 (perfect forecast vs hindsight). Most of the
+  forecast error shows up as a higher monthly peak (569 vs 490 kW).
+- **Better accuracy is not automatically better decisions.** In short tests the forecaster with the lower MAE
+  sometimes made the costlier plan, because one bad hour at the peak costs more than many small errors.
+  Evaluate forecasts by the cost of the decisions they drive, not only by MAE.
+
+**Forecast accuracy in October** (raw forecasts, all leads 0–23 h, every hour):
+
+| Forecaster | MAE load | MAE PV | MAE JEPX price | Skill load | Skill PV | Skill price |
+|---|---|---|---|---|---|---|
+| Persistence | 31.3 kW | 36.9 kW | ¥3.84 | — | — | — |
+| Gradient boosting | 15.3 kW | 37.2 kW | ¥4.85 | **+51%** | −1% | −26% |
+
+The holiday features carry the load forecast (October 12 is Sports Day). PV without a weather forecast
+is no better than yesterday. MPC costs can differ by a few tens of yen between runs, because HiGHS may return
+a different one of several equally optimal plans.
+
+
+## 11. Verification, tests and benchmarks
 
 ```bash
 pytest                      # ~15 s, offline
@@ -466,16 +600,21 @@ Full tables are in [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md) (April 2026,
 
 ---
 
-## 10. Rebuilding the dataset
+## 12. Rebuilding the dataset
 
 ```bash
-python data/prepare_japan_grid_data.py
-python data/prepare_japan_grid_data.py --start-date 2026-04-01 --days 7 --out-csv data/week1.csv
-python data/prepare_japan_grid_data.py --freq 30min --out-csv data/april_2026_30min.csv   # raw data is 30-min
+python data/prepare_japan_grid_data.py      # every TEPCO file in data/raw -> data/japan_2026_hourly.csv
+APRIL=data/raw/eria_jukyu_202604_03.csv
+python data/prepare_japan_grid_data.py --area-csv $APRIL --out-csv data/april_2026_hourly.csv
+python data/prepare_japan_grid_data.py --area-csv $APRIL --freq 30min --out-csv data/april_2026_30min.csv
+python data/prepare_japan_grid_data.py --start-date 2026-08-01 --days 7 --out-csv data/week.csv
 ```
 
-- **Load:** TEPCO area demand, hourly, scaled so the month's peak = 1,000 kW.
-- **Solar:** TEPCO area PV output, scaled so the month's peak = 600 kW.
+- **Load:** TEPCO area demand, hourly, scaled so the *period's* peak = 1,000 kW. Over April–November the peak is
+  in the July heatwave, so the seasonal shape is kept: April loads peak near 600 kW, July at 1,000 kW.
+- **Solar:** TEPCO area PV output, scaled so the period's peak = 600 kW.
+- **Files:** TEPCO has published the monthly files in UTF-8 (April–June) and Shift-JIS (July onward); both are read.
+  Only complete days are kept, because the newest month usually stops mid-day.
 - **Import price:** JEPX Tokyo area price (30-min slots → hourly) + wheeling fee (default ¥8.5/kWh).
 - **Export price:** `min(0.7 × Tokyo price, ¥10/kWh)`.
 
@@ -484,13 +623,14 @@ via `--data`, or send rows as `series` to the API.
 
 ---
 
-## 11. Known limitations / next steps
+## 13. Known limitations / next steps
 
-- **Perfect foresight.** Load, solar and prices are known for the whole horizon. Next step: forecasts plus
-  rolling-horizon re-optimization.
-- **Demand charge.** It is applied to the peak within the horizon. Japanese 基本料金 is based on the highest
-  **30-minute** demand over 12 months, so the next step is carrying the running peak between solves. The model
-  already runs at 30-min resolution (`BessParams(dt_hours=0.5)`), but the CLI and API currently assume hourly data.
+- **Forecasts.** Load and PV come from scaled TEPCO *area* curves, not a metered site, and there is no
+  weather forecast, so PV is hard to beat with persistence. Next: a weather API feature (irradiance, temperature),
+  and quantile forecasts with a reserve sized to forecast uncertainty instead of a fixed peak guard.
+- **Demand charge.** Re-planning carries the month's peak between solves (`prior_peak_kw`), but Japanese
+  基本料金 is set by the highest **30-minute** demand over the last **12 months**. Next: 30-min re-planning (the
+  model already runs at `dt_hours=0.5`; the simulator is hourly) and a 12-month ratchet.
 - **LLM eval not yet run here.** The Claude path is tested offline with a fake client. Its real accuracy needs
   `run_alert_eval --mode llm` with an API key.
 - **Fixed OMMX overhead (~0.5 s per solve).** This matters for many short solves (e.g. a fleet of sites); caching

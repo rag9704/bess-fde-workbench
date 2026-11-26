@@ -8,5 +8,7 @@ ommx-highs-adapter>=2.9,<3      # default solver: HiGHS
 ommx-pyscipopt-adapter>=2.9,<3  # alternative solver: SCIP
 anthropic>=2.14,<3              # LLM backend 1: Claude (alert translation + explanations)
 openai>=1.60,<3                 # LLM backend 2: any OpenAI-compatible endpoint (Gemini, OpenAI, vLLM, ...)
+scikit-learn>=1.5               # load / PV / price forecasting (gradient boosting)
+pyyaml>=6                       # site descriptions for the reusable components
 fastapi>=0.115                  # HTTP API
 uvicorn>=0.30
