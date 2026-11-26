@@ -366,6 +366,7 @@ def _solve_with_scipy(data: dict[str, Any], opts: SolverOptions) -> _RawSolve:
         ("s_imp_cap", T, data["slack_ub_imp"]),
     ]:
         ub[o[name] : o[name] + size] = hi
+    lb[o["p_peak"]] = data.get("prior_peak", 0.0)
     integrality = np.zeros(n, dtype=int)
     if not opts.relax_integrality:
         integrality[o["z_ch"] : o["z_ch"] + T] = 1
@@ -514,14 +515,19 @@ def solve_dispatch(
     auto_recover_infeasible: bool = True,
     solver: str = "highs",
     options: SolverOptions | None = None,
+    prior_peak_kw: float = 0.0,
 ) -> tuple[DispatchResult, DispatchResult | None]:
-    """Solve strict dispatch; if infeasible and auto_recover_infeasible=True, solve elastic fallback."""
+    """Solve strict dispatch; if infeasible and auto_recover_infeasible=True, solve elastic fallback.
+
+    `prior_peak_kw`: import peak already reached in the billing period (rolling re-planning).
+    """
     kwargs = dict(
         df_slice=df_slice,
         params=params,
         soc_min_kwh=soc_min_kwh,
         soc_max_kwh=soc_max_kwh,
         grid_import_cap_kw=grid_import_cap_kw,
+        prior_peak_kw=prior_peak_kw,
     )
     strict = solve_instance(make_instance_data(**kwargs, elastic=False), False, solver, options)
     if strict.status != "INFEASIBLE" or not auto_recover_infeasible:

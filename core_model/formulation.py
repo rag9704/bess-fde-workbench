@@ -64,6 +64,7 @@ def build_problem() -> jm.Problem:
         soc_end_min = problem.Float(description="Minimum terminal SoC [kWh]")
         p_exp_max = problem.Float(description="Grid export cap [kW]")
         p_imp_bound = problem.Float(description="Physical upper bound on import [kW]")
+        prior_peak = problem.Float(description="Peak import already set earlier in the billing period [kW]")
         c_peak = problem.Float(description="Demand charge [yen/kW]")
         c_deg = problem.Float(description="Degradation cost [yen/kWh]")
         m_pen = problem.Float(description="Slack penalty [yen/kWh]")
@@ -78,7 +79,9 @@ def build_problem() -> jm.Problem:
         p_dis = problem.ContinuousVar(shape=(T,), lower_bound=0, upper_bound=p_dis_max)
         soc = problem.ContinuousVar(shape=(T + 1,), lower_bound=0, upper_bound=cap_kwh)
         z_ch = problem.BinaryVar(shape=(T,), description="1 = charging mode, 0 = discharging mode")
-        p_peak = problem.ContinuousVar(lower_bound=0, upper_bound=p_imp_bound)
+        # The demand charge is billed on the billing period's peak. In rolling re-planning, the peak already
+        # reached is a floor: raising it costs c_peak per kW, staying below it is free.
+        p_peak = problem.ContinuousVar(lower_bound=prior_peak, upper_bound=p_imp_bound)
         s_soc_min = problem.ContinuousVar(shape=(T + 1,), lower_bound=0, upper_bound=slack_ub_soc)
         s_imp_cap = problem.ContinuousVar(shape=(T,), lower_bound=0, upper_bound=slack_ub_imp)
 
@@ -125,12 +128,14 @@ def make_instance_data(
     soc_max_kwh: np.ndarray | None = None,
     grid_import_cap_kw: np.ndarray | None = None,
     elastic: bool = False,
+    prior_peak_kw: float = 0.0,
 ) -> dict[str, Any]:
     """Convert a time-series DataFrame slice + operational overrides into model inputs.
 
     `soc_min_kwh` may have length T (per step; the terminal state gets
     max(end_soc_min, last value)) or T+1 (per state).
     `soc_max_kwh` (optional) follows the same length rules and caps the SoC per state.
+    `prior_peak_kw` is the import peak already reached in the billing period (0 for a fresh period).
     """
     T = len(df_slice)
     s_min = np.full(T + 1, params.default_soc_min_frac * params.capacity_kwh, dtype=float)
@@ -163,7 +168,7 @@ def make_instance_data(
 
     load = df_slice["load_kw"].to_numpy(dtype=float)
     # Physically the site can never import more than load + full charge + full export.
-    p_imp_bound = float(np.max(load) + params.max_charge_kw + params.grid_export_cap_kw)
+    p_imp_bound = float(max(np.max(load) + params.max_charge_kw + params.grid_export_cap_kw, prior_peak_kw))
 
     return {
         "T": T,
@@ -183,6 +188,7 @@ def make_instance_data(
         "soc_end_min": float(params.end_soc_min_kwh),
         "p_exp_max": float(params.grid_export_cap_kw),
         "p_imp_bound": p_imp_bound,
+        "prior_peak": float(prior_peak_kw),
         "c_peak": float(params.peak_demand_charge_yen_kw),
         "c_deg": float(params.degradation_cost_yen_kwh),
         "m_pen": float(params.slack_penalty_yen_kwh),
