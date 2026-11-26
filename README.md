@@ -627,7 +627,7 @@ via `--data`, or send rows as `series` to the API.
 
 ---
 
-## 13. Known limitations / next steps
+## 13. [WIP]
 
 - **Forecasts.** Load and PV come from scaled TEPCO *area* curves, not a metered site, and there is no
   weather forecast, so PV is hard to beat with persistence. Next: a weather API feature (irradiance, temperature),
