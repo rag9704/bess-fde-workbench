@@ -1,3 +1,13 @@
+"""Build the site time series from raw TEPCO area data and JEPX spot prices.
+
+    python data/prepare_japan_grid_data.py                       # all TEPCO months in data/raw -> japan_2026_hourly.csv
+    python data/prepare_japan_grid_data.py --area-csv data/raw/eria_jukyu_202604_03.csv \
+        --out-csv data/april_2026_hourly.csv                     # one month
+
+Load and PV are the TEPCO area curves scaled so the *whole period's* peak equals the site's peak load / PV
+capacity, which keeps the seasonal shape (summer peaks, shorter winter days). Only complete days are kept.
+"""
+
 import argparse
 from pathlib import Path
 
@@ -21,18 +31,35 @@ def load_jepx_hourly(jepx_csv: Path, freq: str = "1h") -> pd.DataFrame:
     return df.groupby("timestamp", as_index=False)["tokyo_price_yen_kwh"].mean().round(3)
 
 
+def read_tepco_csv(path: Path) -> pd.DataFrame:
+    """One TEPCO eria_jukyu file. TEPCO has published them in UTF-8 and in Shift-JIS (cp932)."""
+    for encoding in ("utf-8-sig", "cp932"):
+        try:
+            return pd.read_csv(path, encoding=encoding, skiprows=1)
+        except UnicodeDecodeError:
+            continue
+    raise ValueError(f"{path}: neither UTF-8 nor Shift-JIS")
+
+
 def load_tepco_area_hourly(
-    area_csv: Path,
+    area_csv: Path | list[Path],
     site_peak_load_kw: float = 1000.0,
     site_solar_cap_kw: float = 600.0,
     freq: str = "1h",
 ) -> pd.DataFrame:
-    """Parse TEPCO eria_jukyu CSV (utf-8-sig, MW) and scale normalized curves to a BTM site."""
-    df = pd.read_csv(area_csv, encoding="utf-8-sig", skiprows=1)
+    """Parse one or more TEPCO eria_jukyu CSVs (MW, 30-min) and scale the curves to a behind-the-meter site."""
+    paths = [area_csv] if isinstance(area_csv, (str, Path)) else list(area_csv)
+    df = pd.concat([read_tepco_csv(Path(p)) for p in paths], ignore_index=True)
     df["timestamp"] = pd.to_datetime(df["DATE"].str.strip() + " " + df["TIME"].str.strip())
+    df = df.drop_duplicates("timestamp").sort_values("timestamp")
 
     df["demand_mw"] = pd.to_numeric(df["エリア需要"], errors="coerce")
     df["solar_mw"] = pd.to_numeric(df["太陽光発電実績"], errors="coerce").fillna(0.0)
+
+    # Keep complete days only (the newest file usually stops mid-day).
+    slots_per_day = df.groupby(df["timestamp"].dt.date)["timestamp"].count()
+    full_days = set(slots_per_day[slots_per_day == 48].index)
+    df = df[df["timestamp"].dt.date.isin(full_days)]
 
     hourly = df.set_index("timestamp")[["demand_mw", "solar_mw"]].resample(freq).mean().dropna().reset_index()
 
@@ -85,9 +112,15 @@ def build_dataset(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build site BESS time-series CSV from TEPCO & JEPX data.")
-    parser.add_argument("--area-csv", type=Path, default=Path("data/raw/eria_jukyu_202604_03.csv"))
+    parser.add_argument(
+        "--area-csv",
+        type=Path,
+        nargs="+",
+        default=sorted(Path("data/raw").glob("eria_jukyu_*.csv")),
+        help="TEPCO eria_jukyu file(s); default: every one in data/raw",
+    )
     parser.add_argument("--jepx-csv", type=Path, default=Path("data/raw/spot_summary_2026.csv"))
-    parser.add_argument("--out-csv", type=Path, default=Path("data/april_2026_hourly.csv"))
+    parser.add_argument("--out-csv", type=Path, default=Path("data/japan_2026_hourly.csv"))
     parser.add_argument("--wheeling-fee", type=float, default=8.5)
     parser.add_argument("--start-date", type=str, default=None, help="Optional YYYY-MM-DD")
     parser.add_argument("--days", type=int, default=None, help="Optional number of days (e.g. 7 for a week)")
