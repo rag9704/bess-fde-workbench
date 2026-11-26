@@ -1,0 +1,45 @@
+# Production and inventory planning with the SAME building blocks as the battery site.
+# One period = one day, so flows are units/day and costs are yen/unit.
+site: factory_inventory
+description: One production line with setup cost, a contract supplier, a warehouse and customer demand
+data: ../data/factory_demand_daily.csv
+dt_hours: 1.0                          # one step = one period (day)
+
+components:
+  - type: node
+    name: stock_point                  # finished goods (battery site: the electrical bus)
+
+  - type: profile
+    name: customers                    # battery site: load
+    node: stock_point
+    direction: out
+    column: demand_units
+    shortfall_penalty: 400             # yen per unit of lost sales
+
+  - type: producer
+    name: line                         # battery site: (a generator with start cost)
+    node: stock_point
+    capacity: 140                      # units/day
+    min_output: 60                     # if the line runs, it runs at least this much
+    unit_cost: line_unit_cost          # higher on weekends and Golden Week
+    setup_cost: 3000                   # changeover + cleaning per day the line runs
+
+  - type: market
+    name: supplier                     # battery site: grid import
+    node: stock_point
+    buy_price: supplier_price
+    buy_limit: 80                      # units/day the supplier can deliver
+
+  - type: storage
+    name: warehouse                    # battery site: the battery
+    node: stock_point
+    capacity: 600                      # units
+    initial: 150
+    final_min: 150
+    floor: 50                          # safety stock
+    holding_cost: 1.5                  # yen per unit per day
+
+  - type: peak_charge
+    name: supplier_capacity_fee        # battery site: demand charge
+    flow: supplier.buy
+    rate: 600                          # yen per unit/day of reserved supplier capacity

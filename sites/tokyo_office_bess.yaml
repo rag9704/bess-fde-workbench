@@ -1,0 +1,48 @@
+# Behind-the-meter battery + PV at a Tokyo office (the same site as core_model.formulation's defaults).
+site: tokyo_office_bess
+description: 2 MWh / 500 kW battery, 600 kW PV, 1 MW peak load, JEPX-indexed tariff with a demand charge
+data: ../data/april_2026_hourly.csv
+dt_hours: 1.0
+
+components:
+  - type: node
+    name: bus                          # site electrical bus
+
+  - type: profile
+    name: load
+    node: bus
+    direction: out
+    column: load_kw
+
+  - type: profile
+    name: pv
+    node: bus
+    direction: in
+    column: solar_kw
+
+  - type: market
+    name: grid
+    node: bus
+    buy_price: import_price_yen_kwh    # JEPX Tokyo + wheeling
+    sell_price: export_price_yen_kwh
+    buy_limit: 1200                    # contract / transformer limit, kW
+    sell_max: 400                      # export limit, kW
+
+  - type: storage
+    name: battery
+    node: bus
+    capacity: 2000                     # kWh
+    max_in: 500                        # kW
+    max_out: 500
+    eff_in: 0.94
+    eff_out: 0.94
+    initial: 1000
+    final_min: 800
+    floor: 200                         # 10 % reserve
+    throughput_cost: 2.0               # yen per kWh in or out (wear)
+    exclusive_modes: true              # inverter cannot charge and discharge at once
+
+  - type: peak_charge
+    name: demand_charge
+    flow: grid.buy
+    rate: 1400                         # yen per kW of peak import
