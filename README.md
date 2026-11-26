@@ -9,7 +9,7 @@ TEPCO area demand/solar data and JEPX Tokyo spot prices.
   using the same cost function.
 - **AI harness:** operator alerts in English or Japanese ("台風接近、受電を300kWに制限") are read by **Claude**
   into a typed schema. Deterministic guardrails then clamp every value, and overrides can only *tighten*
-  limits. A 30-case bilingual eval measures it. When the limits can't all be met, the optimizer reports
+  limits. On a 30-case bilingual eval it scores 30/30, against 16/30 for the regex rules. When the limits can't all be met, the optimizer reports
   *which* limit breaks, *when*, and *by how much*, and Claude can explain the trade-off to the operator.
 - **Benchmarked:** scaling to 30-min resolution, a quality-vs-time study, and an exact **LP-first** strategy
   that returns the proven MILP optimum about 2.5× faster on real data.
@@ -32,6 +32,8 @@ TEPCO area demand/solar data and JEPX Tokyo spot prices.
 
 Most of the value comes from **peak shaving**: the rule-based policy never lowers the demand-charge peak,
 while the optimizer cuts it by about 17–19%.
+
+![The hottest day of 2026: grid import held flat, evening peak shaved](docs/figures/peak_day_en.png)
 
 ---
 
@@ -409,7 +411,7 @@ python -m ai_harness.evals.run_alert_eval --mode llm --provider openai --model g
 | Translator | Accuracy | Notes |
 |---|---|---|
 | Rule parser | **16/30 (53%)** | fails on clock windows, Japanese windows, MW, end-of-horizon SoC, number-before-keyword |
-| Claude Opus 5.5 + guardrails | *run `--mode llm` with your key* | the report prints per-field accuracy, every failure and the token cost |
+| **Claude Opus 5.5 + guardrails** | **30/30 (100%)** | all fields correct, English and Japanese; 55 s, about $0.31 for the run ([results](ai_harness/evals/results_llm_claude.json)) |
 
 All Claude-path tests run offline with a fake client (`tests/test_llm_harness.py`): request shape, guardrails,
 every fallback path, only-tighten behaviour, and a check that the eval labels agree with the code policy.
@@ -502,6 +504,8 @@ day of week, Japanese holidays / Obon / New Year, the day-after-a-holiday flag, 
 Each target's model predicts the **correction to persistence**, and is used only if it beats persistence on a
 held-out last two weeks of training. A forecaster cannot see the future by construction; a test changes all
 data after the forecast origin and checks the forecast does not move.
+
+![Share of the best possible saving per policy, October 2026](docs/figures/policies_en.png)
 
 **October 2026** (one billing month; trained on April–September site data and January–September JEPX prices;
 full table in [`forecasting/RESULTS.md`](forecasting/RESULTS.md)):
@@ -631,8 +635,9 @@ via `--data`, or send rows as `series` to the API.
 - **Demand charge.** Re-planning carries the month's peak between solves (`prior_peak_kw`), but Japanese
   基本料金 is set by the highest **30-minute** demand over the last **12 months**. Next: 30-min re-planning (the
   model already runs at `dt_hours=0.5`; the simulator is hourly) and a 12-month ratchet.
-- **LLM eval not yet run here.** The Claude path is tested offline with a fake client. Its real accuracy needs
-  `run_alert_eval --mode llm` with an API key.
+- **Small eval set.** 30 cases is enough to separate the rule parser (53%) from Claude (100%), not to measure
+  rare failure modes. Next: grow it from real operator messages, and record each model's results so
+  regressions show up case by case.
 - **Fixed OMMX overhead (~0.5 s per solve).** This matters for many short solves (e.g. a fleet of sites); caching
   the compiled instance and updating only the data would remove most of it.
 - **Baselines with alerts.** The baselines don't model alert overrides, so the comparison is skipped when an
